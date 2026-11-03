@@ -1,6 +1,11 @@
 ---
 name: dev-loop
+version: 1.9.2
+display_name: 研发闭环
+display_name_en: Dev Loop
 description: 研发闭环总控。当用户提出新需求要评估影响面、要判断改代码是否改全、要检查代码健康度、要同步文档、或贴出报错要定位并修复时使用。一个入口串起「需求影响面 → 变更审计 → 文档同步 → 健康检查 → 缺陷定位」五个阶段，带改造理由、依赖图谱、敏感文件确认与偏离告警，执行过程中不需要切换到其他审查/测试技能。
+description_zh: 一条从需求到提交的研发闭环：先出技术方案与影响面清单，再审计改动是否改全，同步文档，检查代码健康度，最后定位并修复缺陷。每个阶段都要你确认后才往下走，改完必测，提交前先过目。
+description_en: An end-to-end dev loop for AI coding agents — tech plan and impact analysis, change audit, doc sync, health check, and bug triage in one flow. Every stage stops for your approval; nothing is committed until you confirm.
 agent_created: true
 ---
 
