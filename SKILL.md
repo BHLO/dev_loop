@@ -125,7 +125,7 @@ python $DL scan  --root <root>           # 首次运行，或目录结构大改�
 - **必须同时出图谱**（`graph.md`）。超过 20 个文件时，图谱里只画「层与层之间」的边，层内文件用折叠列表，不逐条连线。
 - 清单末尾给一个「改动顺序」：从被依赖最多的一端开始，列出前 5 步。
 
-### 5.4 S1 报告必须包含的四块
+### 5.4 S1 报告必须包含的五块
 
 1. 影响面矩阵：`层级 | 对象 | 是否受影响 | 依据(文件:行)`
 2. **改造清单**：§5.2 的六列表格（含理由与依据），待新建标 `(新)`
@@ -142,7 +142,10 @@ python $DL scan  --root <root>           # 首次运行，或目录结构大改�
    python $DL audit  --root <root> --base <HEAD|HEAD~1|main|--staged>
    python $DL impact --root <root> --base <HEAD|HEAD~1|main>
    ```
-   `audit` 拿 state 里的清单和实际 diff 对账，直接给出**漏改 / 越界 / 一致**三张单子；
+   `audit` 拿 state 里的清单和实际 diff 对账，给出**漏改 / 越界 / 动作不符 / 一致**四张单子：
+   - 漏改：计划里有、diff 里没有
+   - 越界：diff 里有、计划里没有
+   - **动作不符**：文件对上了，但计划写"改"、实际是删除或新建
    未跟踪的新建文件也算变更。文档项不在这一步核对，留给 S3。
 2. **三方对齐**，在 `audit` 结果上逐条判定：
    - **漏改**：S1 清单里有、diff 里没有 → P0，必须补齐
@@ -183,15 +186,25 @@ python $DL scan  --root <root>           # 首次运行，或目录结构大改�
 - S3 结束后记录文档基线：在 `.devloop/S3-docs.md` 末尾写「本次更新的文档 + 关键锚点」。
 - 下一轮 S2 结束时，先跑 `drift` 复核上一轮基线是否仍然成立；过期就回到 S3。
 
-### 7.4 文档项也要对账
+### 7.4 文档项对账与基线
 
-S3 收尾跑一次：
+S3 收尾跑两件事：
 
 ```bash
-python $DL audit --root <root> --base <HEAD> --scope docs
+python $DL audit    --root <root> --base <HEAD> --scope docs   # 计划里的文档是否都落地
+python $DL baseline --root <root> --files <本次更新的文档>      # 记录基线
 ```
 
-清单里计划新建/更新的文档，是否都真的落地了。漏的当场补，别留到下一轮。
+基线记录每个文档的内容指纹和**锚点**（文档里引用的路径/符号/接口）。
+下一轮 S2 之后跑 `baseline --check`：
+
+```bash
+python $DL baseline --root <root> --check
+```
+
+- 锚点丢失 → 文档已经不再描述当前代码，回 S3 重写
+- 文档消失 → 回 S3 补
+- 只是内容变了 → 正常更新，确认与本次代码改动有关即可
 
 ### 7.5 别漏这几类文档
 
@@ -235,6 +248,9 @@ README 的命令与参数、API 定义（openapi/swagger/proto/graphql）、数�
 ## 十、敏感文件确认协议
 
 命中 `references/sensitive-files.md` 清单里任一条，**先停下确认，不许直接改**。
+
+> 判定规则只有一份：`references/sensitive-files.md` 末尾的机器可读块，脚本直接读它。
+> 加规则只改那里，别去改脚本——两份规则必然漂移。
 
 ### 10.1 分级
 
@@ -338,7 +354,13 @@ python $DL verify --root <root> --files a.py,b.py    # 只针对这些文件出�
 你验完告诉我，我出提交清单。
 ```
 
-清单是按改动文件类型生成的（接口 / 迁移 / 数据 / 定时任务 / 消息 / 配置 / 页面 / 权限），没覆盖到的场景按 `references/diagnosis-playbook.md` 补。
+清单由两层叠加而成，不是只有一层：
+
+1. **按文件类型**：接口 / 迁移 / 数据 / 定时任务 / 消息 / 配置 / 页面 / 权限 / 文档
+2. **按改动内容**：从 diff 里识别签名变化、表结构改动、新增分支、异常处理、权限判断、配置读取，
+   每命中一类就补一条更具体的测法
+
+同一场景只留一条，总数不超过 10 条。没覆盖到的按 `references/diagnosis-playbook.md` 补。
 
 ### 12.4 产出
 
@@ -441,6 +463,9 @@ python $DL state  --root <root> --set S6 --note "已提交 <sha>，标签 v1.4.0
 ├── sensitive.md      敏感预检：需授权的文件与级别
 ├── audit-code.md     代码项对账（S2）
 ├── audit-docs.md     文档项对账（S3）
+├── doc-baseline.json 文档基线：内容指纹 + 锚点
+├── doc-baseline.md   基线可读版
+├── baseline-check.md 基线复核结果（失效 / 内容已变）
 ├── drift.md/json     文档漂移
 ├── S1-impact.md      影响面 + 改造清单（含理由）+ 依赖图 + 回归范围
 ├── S2-audit.md       漏改/越界/调用方判定/待补测试/SKIPPED 项
@@ -459,7 +484,7 @@ python $DL state  --root <root> --set S6 --note "已提交 <sha>，标签 v1.4.0
 |---|---|---|
 | `scan --root .` | 语言、构建/测试命令、文档清单、入口点、git 状态 | 首次；目录大改后 |
 | `impact --root . --files a.py,b.py` | 不依赖 git 的影响面 | S1 定位锚点后 |
-| `graph --root . --files a.py,b.py --depth 2` | 依赖图：清单内互依赖 + 外部受影响方，出 Mermaid | S1 出清单后 |
+| `graph --root . --files a.py,b.py --depth 2` | 依赖图：清单内互依赖 + 外部受影响方；`--format ascii/mermaid/both` | S1 出清单后 |
 | `impact --root . --base HEAD~1` | 变更影响面 + 风险分 | S2 |
 | `drift --root . --changed a.py` | 文档漂移 + 本次改动涉及的文档 | S3；S2 复核基线 |
 | `state --show / --set S2 --note "..." / --add "..." / --close N` | 阶段续做 | 每阶段收尾 |
@@ -467,7 +492,9 @@ python $DL state  --root <root> --set S6 --note "已提交 <sha>，标签 v1.4.0
 | `python scripts/stackmap.py --root . --log err.log` | 栈帧映射：堆栈 → 仓库内 `文件:行` | S5 第 2 步 |
 | `sensitive --root . --files a,b` | 敏感预检：清单里哪些文件改前需授权（返回 3 高危 / 4 中危） | S1 清单定稿后 |
 | `audit --root . --base HEAD` | 清单 vs diff 对账：漏改 / 越界 / 一致；`--scope docs` 核对文档项 | S2、S3 收尾 |
-| `verify --root . [--cmd "pytest -q"]` | 跑测试 + 出自测清单，未通过返回非 0 | 每次代码改动后 |
+| `baseline --root . --files a.md` | 记录文档基线（内容指纹 + 锚点） | S3 收尾 |
+| `baseline --root . --check` | 复核基线：锚点丢失 / 文档消失就返回非 0 | 下一轮 S2 之后 |
+| `verify --root . [--cmd "pytest -q"]` | 跑测试 + 出自测清单（路径 + diff 特征两层），未通过返回非 0 | 每次代码改动后 |
 | `commit --root . --message "..." [--bump minor]` | 生成提交清单，**默认不提交** | 提交前 |
 | `commit --apply --message "..." [--tag vX.Y.Z]` | 用户确认后执行提交与打标签 | 用户同意后 |
 

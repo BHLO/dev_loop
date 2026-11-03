@@ -23,6 +23,7 @@ devloop — 研发闭环工具箱（单一入口，四阶段共用一套扫描�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -32,7 +33,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -87,7 +88,8 @@ DEF_RE = re.compile(
 )
 ROUTE_RE = re.compile(r"""["'](/[A-Za-z0-9_\-./{}<>:$]{3,})["']""")
 IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{3,})\b")
-CODE_SPAN_RE = re.compile(r"`([^`\n]{2,120})`")
+# 最少 1 字符：否则单字符行内代码会让整行的反引号配对整体错位
+CODE_SPAN_RE = re.compile(r"`([^`\n]{1,120})`")
 FENCE_RE = re.compile(r"```[ \t]*([\w+-]*)\n(.*?)```", re.DOTALL)
 PATH_HINT_RE = re.compile(r"[/\\]|\.[A-Za-z0-9]{1,6}$")
 
@@ -822,6 +824,16 @@ def cmd_graph(args) -> int:
         lines.append(f'  {index[src]} -->|"{tag}"| {index[dst]}')
         shown += 1
 
+    ascii_lines = ["改造范围（L0）"]
+    for tgt in [p for p in nodes if level_of.get(p) == 0]:
+        ascii_lines.append(f"├─ {tgt}" + ("　[待新建]" if tgt in missing else ""))
+        deps = [(s, v) for (s, d), v in edges.items() if d == tgt]
+        for i, (s, v) in enumerate(sorted(deps)[:8]):
+            branch = "│   └──" if i == len(deps[:8]) - 1 else "│   ├──"
+            ascii_lines.append(f"{branch} ← {s}　(L{level_of.get(s, '?')}，" + ", ".join(sorted(v)[:2]) + ")")
+        if len(deps) > 8:
+            ascii_lines.append(f"│   └── …… 另有 {len(deps) - 8} 个依赖方")
+
     lines.append("  classDef target fill:#DBEAFE,stroke:#2563EB,stroke-width:2px,color:#1E3A8A")
     lines.append("  classDef dep fill:#F8FAFC,stroke:#CBD5E1,color:#334155")
     lines.append("  classDef newone fill:#FFFBEB,stroke:#F59E0B,stroke-dasharray:5 3,color:#92400E")
@@ -854,7 +866,11 @@ def cmd_graph(args) -> int:
         for m in missing:
             md.append(f"> - `{m}`")
         md.append("")
-    md += ["## 图", "", "```mermaid", *lines, "```", "", "## 分层", ""]
+    if args.format in ("ascii", "both"):
+        md += ["## 终端视图", "", "```", *ascii_lines, "```", ""]
+    if args.format in ("mermaid", "both"):
+        md += ["## 图（Mermaid）", "", "```mermaid", *lines, "```", ""]
+    md += ["## 分层", ""]
     names = {0: "改造范围（S1 清单内）", 1: "直接受影响", 2: "间接受影响", 3: "更远"}
     for lv in sorted(by_level):
         md.append(f"**{names.get(lv, f'第 {lv} 层')}**（{len(by_level[lv])}）")
@@ -909,7 +925,7 @@ SELFTEST_RULES = [
      "渲染后读一遍：目录、链接、示例代码是否正常"),
 ]
 
-SENSITIVE_PATTERNS = [
+DEFAULT_SENSITIVE_RULES = [
     ("高危", "数据库迁移", r"(^|/)(migrations?|alembic/versions)/"),
     ("高危", "SQL 脚本", r"\.sql$"),
     ("高危", "密钥/证书", r"\.(pem|key|p12|jks)$"),
@@ -924,12 +940,71 @@ SENSITIVE_PATTERNS = [
     ("中危", "容器与编排", r"(Dockerfile|docker-compose|(^|/)k8s/|(^|/)helm/)"),
 ]
 
+_RULES_CACHE: list | None = None
+
+
+def rules_source_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "references" / "sensitive-files.md"
+
+
+def load_sensitive_rules() -> list[tuple[str, str, str]]:
+    """规则只有一份：references/sensitive-files.md 里的机器可读块。
+
+    读不到或解析失败才退回内置默认，并给出警告——不让两份规则各自漂移。
+    """
+    global _RULES_CACHE
+    if _RULES_CACHE is not None:
+        return _RULES_CACHE
+
+    p = rules_source_path()
+    if not p.exists():
+        print("[warn] 未找到 references/sensitive-files.md，使用内置默认规则", file=sys.stderr)
+        _RULES_CACHE = DEFAULT_SENSITIVE_RULES
+        return _RULES_CACHE
+
+    text = read_text(p)
+    block = ""
+    for m in re.finditer(r"```ya?ml\n(.*?)```", text, re.S):
+        if "level:" in m.group(1):
+            block = m.group(1)
+            break
+
+    rules, cur = [], {}
+    for line in block.splitlines():
+        s = line.strip()
+        if s.startswith("- level:"):
+            if cur.get("level") and cur.get("pattern"):
+                rules.append((cur["level"], cur.get("label", ""), cur["pattern"]))
+            cur = {"level": s.split(":", 1)[1].strip()}
+        elif s.startswith("label:") and cur:
+            cur["label"] = s.split(":", 1)[1].strip()
+        elif s.startswith("pattern:") and cur:
+            raw = s.split(":", 1)[1].strip()
+            cur["pattern"] = raw.strip("'\"")
+    if cur.get("level") and cur.get("pattern"):
+        rules.append((cur["level"], cur.get("label", ""), cur["pattern"]))
+
+    valid = []
+    for level, label, pat in rules:
+        try:
+            re.compile(pat)
+            valid.append((level, label, pat))
+        except re.error:
+            print(f"[warn] 规则正则无效，已跳过：{label} {pat}", file=sys.stderr)
+
+    if len(valid) < 5:
+        print("[warn] 规则块解析结果过少，改用内置默认规则", file=sys.stderr)
+        valid = DEFAULT_SENSITIVE_RULES
+
+    _RULES_CACHE = valid
+    return _RULES_CACHE
+
 
 def classify_sensitive(files: list[str]) -> list[dict]:
     """返回 [{file, level, label}]，按清单顺序取第一个命中。"""
     out = []
     for f in files:
-        for level, label, pat in SENSITIVE_PATTERNS:
+        for level, label, pat in load_sensitive_rules():
             if re.search(pat, f, re.IGNORECASE):
                 out.append({"file": f, "level": level, "label": label})
                 break
@@ -953,6 +1028,45 @@ def git_status_entries(root: Path) -> list[dict]:
             continue
         entries.append({"status": code, "file": path})
     return entries
+
+
+FEATURE_RULES = [
+    ("签名变化", r"^\s*(?:async\s+)?(?:def|function|func|public|private|protected|static)\b.*\(",
+     "调用方要跟着改：入参、返回值、异常各验一次"),
+    ("表结构/字段", r"^\s*(?:ALTER|CREATE)\s|^\s*[a-z_]+\s*:\s*(?:int|str|bool|float|Decimal|Optional|List)",
+     "新字段写入后读回；存量数据能否正常解析"),
+    ("分支条件", r"^\s*(?:if|elif|else|switch|case)\b",
+     "新条件的两条路径各走一次，确认默认分支没错"),
+    ("异常处理", r"^\s*(?:try|except|catch|raise|throw)\b",
+     "构造一次失败，看是否被吞掉、提示是否可读"),
+    ("权限判断", r"(?:login_required|PreAuthorize|hasRole|check_permission|require_auth|@auth)",
+     "用无权限账号访问一次，确认被拦住"),
+    ("配置读取", r"(?:getenv|os\.environ|config\[|@Value|process\.env)",
+     "缺配置启动一次，看是否有兜底而不是崩"),
+]
+
+
+def changed_lines(root: Path, path: str, base: str) -> list[str]:
+    """取某个文件的改动行；未跟踪文件退回整文件。"""
+    rc, out = git(root, "diff", base, "-U0", "--", path)
+    if rc == 0 and out:
+        # 去掉行首的 +/-，否则 ^def 之类的模式永远匹配不上
+        return [ln[1:] for ln in out.splitlines()
+                if ln[:1] in "+-" and not ln.startswith(("+++", "---"))]
+    return read_text(root / path, limit=400_000).splitlines()
+
+
+def diff_features(root: Path, files: list[str], base: str) -> list[dict]:
+    """从改了什么代码，推出该额外测什么——比只看路径精准一层。"""
+    rows = []
+    for f in files:
+        lines = changed_lines(root, f, base)
+        if not lines:
+            continue
+        for label, pat, how in FEATURE_RULES:
+            if any(re.search(pat, ln) for ln in lines):
+                rows.append({"scene": label, "how": how, "file": f, "from_diff": True})
+    return rows
 
 
 def build_selftest_checklist(files: list[str]) -> list[dict]:
@@ -1009,6 +1123,11 @@ def cmd_verify(args) -> int:
     if not changed:
         changed = [e["file"] for e in git_status_entries(root)]
     checklist = build_selftest_checklist(changed)
+    for feat in diff_features(root, changed, args.base):
+        if any(r["scene"] == feat["scene"] and r["file"] == feat["file"] for r in checklist):
+            continue
+        checklist.insert(0, feat)
+    checklist = checklist[:10]
 
     md = ["# 验证报告", "", f"- 生成时间：{now()}", f"- 项目根：`{root}`",
           f"- 涉及改动：{len(changed)} 个文件", ""]
@@ -1275,6 +1394,37 @@ def cmd_sensitive(args) -> int:
 
 # ----------------------------------------------------------------------------- audit
 
+ACTION_MAP = [
+    ("增", ("增", "新增", "新建", "add", "create", "new")),
+    ("删", ("删", "删除", "移除", "delete", "del", "remove")),
+    ("改", ("改", "修改", "调整", "重构", "modify", "update", "refactor", "fix")),
+]
+
+
+def parse_planned_action(text: str) -> str:
+    """从 `C1 | 文件 | 动作 | 理由` 里取出动作；取不到返回空串。"""
+    parts = [x.strip() for x in text.split("|")]
+    if len(parts) >= 3:
+        raw = parts[2].lower()
+        for canon, keys in ACTION_MAP:
+            if any(k in raw for k in keys):
+                return canon
+    for canon, keys in ACTION_MAP:      # 没有竖线分隔时，退化为全文匹配
+        if any(k in text for k in keys):
+            return canon
+    return ""
+
+
+def op_matches_status(action: str, status: str) -> bool:
+    if action == "增":
+        return status in ("A", "?")
+    if action == "删":
+        return status == "D"
+    if action == "改":
+        return status in ("M", "R")
+    return True
+
+
 PLAN_PATH_RE = re.compile(
     r"([\w./\\-]+\.(?:py|pyi|js|mjs|cjs|ts|tsx|jsx|vue|java|kt|go|rs|cs|cpp|cc|h|php|"
     r"rb|swift|scala|sql|md|rst|ya?ml|json|xml|toml|gradle|sh|ps1))")
@@ -1292,13 +1442,19 @@ def cmd_audit(args) -> int:
             items = json.loads(state_path.read_text(encoding="utf-8")).get("open_items", [])
         except Exception:
             items = []
-    planned: dict[str, list[str]] = {}
+    planned: dict[str, dict] = {}
     for it in items:
         if it.get("done"):
             continue
-        m = PLAN_PATH_RE.search(it.get("item", ""))
-        if m:
-            planned.setdefault(m.group(1).replace("\\", "/"), []).append(it["item"])
+        text = it.get("item", "")
+        m = PLAN_PATH_RE.search(text)
+        if not m:
+            continue
+        path = m.group(1).replace("\\", "/")
+        entry = planned.setdefault(path, {"items": [], "action": ""})
+        entry["items"].append(text)
+        if not entry["action"]:
+            entry["action"] = parse_planned_action(text)
 
     base = args.base
     rc, diff = git(root, "diff", "--name-status", base)
@@ -1327,6 +1483,15 @@ def cmd_audit(args) -> int:
     extra = [p for p in changed if p not in planned]
     both = [p for p in planned if p in changed]
 
+    # 动作核对：计划写"改"，实际是删除/新建，也算不符
+    mismatched = []
+    for p in both:
+        want = planned[p]["action"]
+        got = changed[p]
+        if not want or op_matches_status(want, got):
+            continue
+        mismatched.append({"file": p, "plan": want, "actual": got})
+
     scope_name = {"code": "代码", "docs": "文档", "all": "全部"}.get(scope, scope)
     md = ["# 变更审计对账", "", f"- 生成时间：{now()}",
           f"- 对比基线：{base}",
@@ -1339,7 +1504,7 @@ def cmd_audit(args) -> int:
     md += ["## 漏改（计划里有、diff 里没有）", ""]
     if missing:
         for p in missing:
-            md.append(f"- `{p}`　← {'；'.join(planned[p])[:80]}")
+            md.append(f"- `{p}`　← {'；'.join(planned[p]['items'])[:80]}")
     else:
         md.append("无")
     md += ["", "## 越界（diff 里有、计划里没有）", ""]
@@ -1349,18 +1514,113 @@ def cmd_audit(args) -> int:
             md.append(f"- `{p}` {flag}")
     else:
         md.append("无")
+    md += ["", "## 动作不符（文件对上了，做的事不一样）", ""]
+    if mismatched:
+        names = {"M": "改", "A": "新增", "D": "删除", "R": "重命名"}
+        for item in mismatched:
+            md.append(f"- `{item['file']}`：计划「{item['plan']}」，实际「{names.get(item['actual'], item['actual'])}」")
+    else:
+        md.append("无")
     md += ["", "## 一致", ""]
-    md += [f"- `{p}`（{changed[p]}）" for p in both] or ["无"]
+    md += [f"- `{p}`（{changed[p]}）" for p in both if p not in {m['file'] for m in mismatched}] or ["无"]
     md += ["", "> 漏改不等于必须改：确认后可以把该项标为 SKIPPED 并写明原因。", ""]
 
     fname = "audit.md" if scope == "all" else f"audit-{scope}.md"
     (out_dir / fname).write_text("\n".join(md), encoding="utf-8")
-    print(f"对账 -> {out_dir / fname}（漏改 {len(missing)} / 越界 {len(extra)} / 一致 {len(both)}）")
+    print(f"对账 -> {out_dir / fname}（漏改 {len(missing)} / 越界 {len(extra)} / "
+          f"动作不符 {len(mismatched)} / 一致 {len(both) - len(mismatched)}）")
     for p in missing:
         print(f"  漏改：{p}")
     for p in extra:
         print(f"  越界：{p}")
-    return 1 if missing else 0
+    for item in mismatched:
+        print(f"  动作不符：{item['file']} 计划 {item['plan']} 实际 {item['actual']}")
+    return 1 if (missing or mismatched) else 0
+
+
+# ----------------------------------------------------------------------------- baseline
+
+def doc_anchors(text: str) -> list[str]:
+    """文档里引用的路径 / 符号 / 接口——将来文档失效，靠这些锚点检测。"""
+    out = []
+    for m in CODE_SPAN_RE.finditer(text):
+        kind, val = classify_claim(m.group(1))
+        if kind in ("path", "symbol", "endpoint") and val:
+            out.append(val)
+    return sorted(set(out))[:40]
+
+
+def doc_sha(path: Path) -> str:
+    return hashlib.sha1(read_text(path, limit=2_000_000).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def cmd_baseline(args) -> int:
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+    path = out_dir / "doc-baseline.json"
+
+    if args.check:
+        if not path.exists():
+            print("还没有文档基线。先跑一次不带 --check 的 baseline。")
+            return 2
+        data = json.loads(path.read_text(encoding="utf-8"))
+        broken, changed = [], []
+        for d in data.get("docs", []):
+            f = root / d["file"]
+            if not f.exists():
+                broken.append({"file": d["file"], "why": "文档已不存在"})
+                continue
+            text = read_text(f, limit=400_000)
+            lost = [a for a in d.get("anchors", []) if a and a not in text]
+            if lost:
+                broken.append({"file": d["file"], "why": "锚点丢失：" + "、".join(lost[:5])})
+            elif doc_sha(f) != d.get("sha"):
+                changed.append(d["file"])
+
+        md = ["# 文档基线检查", "", f"- 生成时间：{now()}",
+              f"- 基线时间：{data.get('generated_at', '?')}",
+              f"- 基线提交：{data.get('commit', '?')}",
+              f"- 文档数：{len(data.get('docs', []))}", ""]
+        md += ["## 失效（需要回 S3）", ""]
+        md += [f"- `{b['file']}`：{b['why']}" for b in broken] or ["无"]
+        md += ["", "## 内容已变（确认是否与本次代码改动有关）", ""]
+        md += [f"- `{f}`" for f in changed] or ["无"]
+        md += ["", "> 锚点丢失比内容变化严重：说明文档已经不再描述当前的代码符号。", ""]
+        (out_dir / "baseline-check.md").write_text("\n".join(md), encoding="utf-8")
+
+        print(f"基线检查 -> {out_dir / 'baseline-check.md'}（失效 {len(broken)} / 内容已变 {len(changed)}）")
+        for b in broken:
+            print(f"  失效：{b['file']} —— {b['why']}")
+        return 1 if broken else 0
+
+    files = [x.strip() for x in args.files.split(",") if x.strip()] if args.files else []
+    if not files:
+        profile = load_profile(root)
+        files = profile.get("docs", [])
+    files = [f for f in files if (root / f).exists()]
+    if not files:
+        print("没有可记录的文档。用 --files 指定。")
+        return 2
+
+    docs = []
+    for f in files:
+        text = read_text(root / f, limit=400_000)
+        docs.append({"file": f, "sha": doc_sha(root / f), "anchors": doc_anchors(text),
+                     "lines": len(text.splitlines())})
+    payload = {"generated_at": now(), "commit": git(root, "rev-parse", "--short", "HEAD")[1] or "?",
+               "docs": docs}
+    write_json(path, payload)
+
+    md = ["# 文档基线", "", f"- 生成时间：{payload['generated_at']}",
+          f"- 提交：{payload['commit']}", f"- 文档数：{len(docs)}", "",
+          "| 文档 | 行数 | 锚点数 |", "|---|---|---|"]
+    for d in docs:
+        md.append(f"| `{d['file']}` | {d['lines']} | {len(d['anchors'])} |")
+    md += ["", "下一轮 S2 之后跑 `baseline --check` 复核；锚点丢失就回 S3。", ""]
+    (out_dir / "doc-baseline.md").write_text("\n".join(md), encoding="utf-8")
+
+    print(f"文档基线 -> {path}（{len(docs)} 个文档，{sum(len(d['anchors']) for d in docs)} 个锚点）")
+    return 0
 
 
 # ----------------------------------------------------------------------------- state
@@ -1435,6 +1695,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--files", default="", help="改造清单文件，逗号分隔；省略则读 impact.json")
     g.add_argument("--depth", type=int, default=1, help="向下展开层数，1-3，默认 1")
     g.add_argument("--max-nodes", type=int, default=40, help="节点上限，默认 40")
+    g.add_argument("--format", choices=["ascii", "mermaid", "both"], default="both",
+                   help="输出形态：终端视图 / Mermaid / 两者都要，默认 both")
     g.set_defaults(func=cmd_graph)
 
     v = sub.add_parser("verify", help="跑测试并生成自测清单")
@@ -1442,6 +1704,7 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--cmd", default="", help="测试命令，省略则用 profile 里检测到的")
     v.add_argument("--files", default="", help="只针对这些改动文件生成自测清单")
     v.add_argument("--timeout", type=int, default=900, help="超时秒数，默认 900")
+    v.add_argument("--base", default="HEAD", help="取自测特征时的对比基线，默认 HEAD")
     v.add_argument("--dry-run", action="store_true", help="只显示将执行的命令")
     v.set_defaults(func=cmd_verify)
 
@@ -1456,6 +1719,12 @@ def build_parser() -> argparse.ArgumentParser:
     au.add_argument("--scope", choices=["code", "docs", "all"], default="code",
                     help="对账范围：code 只对代码项（S2），docs 只对文档项（S3），默认 code")
     au.set_defaults(func=cmd_audit)
+
+    b = sub.add_parser("baseline", help="文档基线：记录或复核")
+    b.add_argument("--root", default=".")
+    b.add_argument("--files", default="", help="要记录的文档，逗号分隔；省略则用 profile 里的文档清单")
+    b.add_argument("--check", action="store_true", help="复核基线是否失效")
+    b.set_defaults(func=cmd_baseline)
 
     c = sub.add_parser("commit", help="生成提交清单（默认不提交）")
     c.add_argument("--root", default=".")

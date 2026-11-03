@@ -75,6 +75,9 @@ class SkillRules(unittest.TestCase):
             "环境问题区分": "环境问题",
             "自测清单": "自测清单",
             "提交确认": "清单先给用户看",
+            "动作核对": "动作不符",
+            "文档基线": "baseline --root",
+            "唯一事实源": "判定规则只有一份",
             "重大改动": "重大改动",
             "标签规范": "语义化版本",
         }
@@ -84,7 +87,8 @@ class SkillRules(unittest.TestCase):
 
     def test_every_subcommand_documented(self) -> None:
         body = section(self.text, "十六、脚本参考")
-        for cmd in ("scan", "impact", "graph", "drift", "sensitive", "audit", "verify", "commit"):
+        for cmd in ("scan", "impact", "graph", "drift", "sensitive", "audit",
+                    "baseline", "verify", "commit"):
             with self.subTest(cmd=cmd):
                 self.assertIn(f"`{cmd} ", body + self.text, f"脚本表缺 {cmd}")
 
@@ -97,6 +101,18 @@ class SkillRules(unittest.TestCase):
             with self.subTest(ref=ref.name):
                 self.assertIn(f"references/{ref.name}", self.text,
                               f"{ref.name} 没有被 SKILL.md 引用，等于不生效")
+
+    def test_rules_block_matches_default(self) -> None:
+        """references 里的机器可读块必须和脚本内置默认一致，否则就是两份规则。"""
+        import sys
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import devloop
+        devloop._RULES_CACHE = None
+        md_rules = devloop.load_sensitive_rules()
+        self.assertEqual(len(md_rules), len(devloop.DEFAULT_SENSITIVE_RULES))
+        self.assertEqual([r[1] for r in md_rules],
+                         [r[1] for r in devloop.DEFAULT_SENSITIVE_RULES],
+                         "规则名称或顺序不一致，说明两边已漂移")
 
     def test_skill_md_not_bloated(self) -> None:
         zh = len(re.findall(r"[\u4e00-\u9fff]", self.text))

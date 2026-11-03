@@ -75,3 +75,55 @@ jdbc:[a-z]+://[^"\s]+                 # 生产连接串
 ```
 
 下一轮再动同一文件，需要重新确认——授权不继承。
+
+---
+
+## 七、机器可读规则（脚本读这一段）
+
+`scripts/devloop.py` 的敏感判定直接读下面这个块，**这是唯一的事实源**——
+改规则只改这里，不要再去脚本里改数组。表格（§一、§二）是给人看的说明，脚本不读。
+
+修改后跑一次自检：`python tests/test_skill_rules.py`
+
+```yaml
+rules:
+  - level: 高危
+    label: 数据库迁移
+    pattern: '(^|/)(migrations?|alembic/versions)/'
+  - level: 高危
+    label: SQL 脚本
+    pattern: '\.sql$'
+  - level: 高危
+    label: 密钥/证书
+    pattern: '\.(pem|key|p12|jks)$'
+  - level: 高危
+    label: 环境配置
+    pattern: '(^|/)\.env'
+  - level: 高危
+    label: CI/CD
+    pattern: '(\.github/workflows/|\.gitlab-ci\.yml|Jenkinsfile|azure-pipelines)'
+  - level: 高危
+    label: 权限鉴权
+    pattern: '(^|/)(auth|security)/|(permission|rbac|acl)'
+  - level: 高危
+    label: 生产配置
+    pattern: '(prod|production)[\w.-]*\.(ya?ml|properties|env)$'
+  - level: 高危
+    label: 发布脚本
+    pattern: '(^|/)(deploy|release|rollback)'
+  - level: 高危
+    label: 依赖锁文件
+    pattern: '(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|poetry\.lock|go\.sum|Cargo\.lock)'
+  - level: 中危
+    label: 公共基础库
+    pattern: '(^|/)(common|utils|core|shared|lib)/'
+  - level: 中危
+    label: 依赖清单
+    pattern: '(package\.json|pom\.xml|requirements\.txt|pyproject\.toml|go\.mod|Cargo\.toml)$'
+  - level: 中危
+    label: 容器与编排
+    pattern: '(Dockerfile|docker-compose|(^|/)k8s/|(^|/)helm/)'
+```
+
+**加一条规则的步骤**：在块里追加 `- level / label / pattern` 三项，pattern 用单引号包住，
+反斜杠写两个；再在上面表格补一行说明。脚本下次运行就生效。

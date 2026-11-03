@@ -29,6 +29,9 @@ jobs:
       - name: 行为测试
         run: python tests/test_devloop.py
 
+      - name: 深度测试
+        run: python tests/test_deep.py
+
       - name: 规则完整性
         run: python tests/test_skill_rules.py
 
