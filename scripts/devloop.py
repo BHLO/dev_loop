@@ -34,7 +34,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.9.2"
+VERSION = "1.9.3"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -2118,6 +2118,123 @@ def cmd_baseline(args) -> int:
     return 0
 
 
+# ----------------------------------------------------------------------------- hook
+
+def plan_fingerprint(root: Path, files: list[str], message: str) -> str:
+    """与 commit 阶段完全一致的指纹算法，供 hook 复用。"""
+    entries = [{"file": f, "status": "?"} for f in files]
+    return hashlib.sha1(
+        ("|".join(sorted(files)) + "\n" + message + "\n"
+         + (git(root, "rev-parse", "HEAD")[1] or "")
+         + "\n" + worktree_signature(root, entries)).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def clean_commit_message(text: str) -> str:
+    """去掉 git 自动加的注释行与首尾空白。"""
+    lines = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+    return "\n".join(lines).strip()
+
+
+def cmd_check_commit(args) -> int:
+    """commit-msg hook 调用：没走过 `commit` 清单的提交，一律拒绝。"""
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+    plan_json = out_dir / "commit-plan.json"
+
+    if not plan_json.exists():
+        print("[dev-loop] 拒绝提交：没有提交清单。")
+        print("  先跑：python <dev-loop>/scripts/devloop.py commit --root . --message \"...\"")
+        print("  把清单给用户过目，用户同意后再提交。")
+        return 1
+
+    try:
+        saved = json.loads(plan_json.read_text(encoding="utf-8"))
+    except Exception:
+        print("[dev-loop] 拒绝提交：commit-plan.json 解析失败，重新出一份清单。")
+        return 1
+
+    msg = ""
+    if getattr(args, "message_file", ""):
+        mf = Path(args.message_file)
+        if not mf.is_absolute():
+            mf = root / mf
+        if mf.exists():
+            msg = clean_commit_message(read_text(mf))
+    if not msg:
+        msg = saved.get("message", "")
+
+    expect = plan_fingerprint(root, saved.get("files", []), msg)
+    if expect != saved.get("token"):
+        print("[dev-loop] 拒绝提交：这次提交和用户看过的清单不一致。")
+        if msg != saved.get("message", ""):
+            print(f"  清单里的信息：{saved.get('message', '')[:60]}")
+            print(f"  你给的信息：  {msg[:60]}")
+        else:
+            print("  文件集合或内容在出清单之后变过，或者 HEAD 变了。")
+        print("  重新出清单 → 给用户过目 → 再提交。")
+        return 1
+
+    print("[dev-loop] 提交清单校验通过。")
+    return 0
+
+
+HOOK_SH = """#!/bin/sh
+# dev-loop: 没有经过用户确认的提交一律拒绝（由 devloop.py install-hook 生成）
+exec "{python}" "{script}" check-commit --root "$(git rev-parse --show-toplevel)" --message-file "$1"
+"""
+
+
+def cmd_install_hook(args) -> int:
+    """把 commit-msg hook 装进当前仓库，拦住绕过 tools 的直接提交。"""
+    root = Path(args.root).resolve()
+    rc, hooks_dir = git(root, "rev-parse", "--git-path", "hooks")
+    if rc != 0:
+        print("不是 git 仓库，装不了 hook。")
+        return 2
+
+    target = Path(hooks_dir)
+    if not target.is_absolute():
+        target = root / target
+    target.mkdir(parents=True, exist_ok=True)
+    hook = target / "commit-msg"
+
+    if hook.exists() and "dev-loop" not in read_text(hook, limit=4000):
+        print(f"{hook} 已存在且不是本技能生成的，不覆盖。")
+        print("  要接管就把原文件挪走再装一次。")
+        return 2
+
+    # 用正斜杠：hook 是 sh 脚本，Windows 反斜杠在双引号里不可靠
+    hook.write_text(
+        HOOK_SH.format(python=Path(sys.executable).as_posix(),
+                       script=Path(__file__).resolve().as_posix()),
+        encoding="utf-8", newline="\n")
+    try:
+        hook.chmod(0o755)
+    except Exception:
+        pass
+
+    # 顺手排除 .devloop/：否则 `git add -A` 会把分析产物一起提交
+    rc2, exclude_path = git(root, "rev-parse", "--git-path", "info/exclude")
+    if rc2 == 0:
+        ex = Path(exclude_path)
+        if not ex.is_absolute():
+            ex = root / ex
+        ex.parent.mkdir(parents=True, exist_ok=True)
+        cur = read_text(ex)
+        if ".devloop/" not in cur:
+            with ex.open("a", encoding="utf-8", newline="\n") as f:
+                if cur and not cur.endswith("\n"):
+                    f.write("\n")
+                f.write("# dev-loop 分析产物，不进版本库\n.devloop/\n")
+            print("  已在 .git/info/exclude 排除 .devloop/，产物不会被误提交")
+
+    print(f"已安装 commit-msg hook -> {hook}")
+    print("  之后任何 `git commit` 都必须先有匹配的提交清单，否则被拒。")
+    print("  注意：`git commit --no-verify` 能跳过它——那是显式违规，SKILL.md 里禁止。")
+    return 0
+
+
 # ----------------------------------------------------------------------------- state
 
 def cmd_state(args) -> int:
@@ -2324,6 +2441,15 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--note", default="", help="用户原话，确认或跳过时必填")
     g.add_argument("--show", action="store_true", help="查看各阶段确认状态")
     g.set_defaults(func=cmd_gate)
+
+    ck = sub.add_parser("check-commit", help="供 commit-msg hook 调用：校验提交清单")
+    ck.add_argument("--root", default=".")
+    ck.add_argument("--message-file", default="", help="commit-msg hook 传入的消息文件")
+    ck.set_defaults(func=cmd_check_commit)
+
+    ih = sub.add_parser("install-hook", help="安装 commit-msg hook，拦住绕过工具的提交")
+    ih.add_argument("--root", default=".")
+    ih.set_defaults(func=cmd_install_hook)
 
     pl = sub.add_parser("plan", help="兼容别名：等同 gate --stage S1")
     pl.add_argument("--root", default=".")

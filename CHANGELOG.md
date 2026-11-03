@@ -2,6 +2,35 @@
 
 遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.9.3] - 2026-11-03
+
+补一个真实漏洞：**agent 可以直接 `git commit`，绕过整套提交门禁**。
+
+### 修复
+
+- **`git commit` 不受管束**：`commit --apply` 的限制只对走工具的路有效。agent 完全可以
+  跳过 `commit`，直接 `git commit -m "..."`，指纹校验、清单确认全部绕开。
+  新增 `install-hook`：在仓库里装 `commit-msg` hook，任何提交都要先有匹配的清单。
+  校验三件事——有没有清单、清单是否匹配当前改动、提交信息是否一致，任一不对就拒绝。
+
+### 新增
+
+- **`install-hook --root .`**：安装 `commit-msg` hook，并把 `.devloop/` 写进
+  `.git/info/exclude`，免得 `git add -A` 把分析产物带进提交。
+- **`check-commit --message-file <f>`**：供 hook 调用，复用与 `commit` 一致的指纹算法。
+
+### 已知边界
+
+- `git commit --no-verify` 能跳过 hook —— git 原生能力，工具层拦不住。
+  SKILL.md 列入禁止项，除非用户明确要求。
+- hook 里写的是安装时的绝对路径（正斜杠形式），换机器或移动技能目录后需重装。
+
+### 测试
+
+- 走查新增 `HookGate` 5 项：无清单被拒、清单匹配放行、出清单后改代码被拒、
+  改提交信息被拒、`.devloop` 不进待提交列表。
+- 入库 81 项 + 本地走查 35 项 + 绕过探测 22 项。
+
 ## [1.9.2] - 2026-11-03
 
 SKILL.md 通读去重：**-542 字 / -74 行**，规则一条没少，全量测试仍绿。
