@@ -46,11 +46,11 @@ The skill follows the common `SKILL.md` convention — drop it into your client'
 
 ```bash
 # user-level
-git clone <repo-url> ~/.workbuddy/skills/dev-loop
+git clone https://github.com/BHLO/dev_loop.git ~/.workbuddy/skills/dev-loop
 
 # project-level (shared with the repo)
 mkdir -p .workbuddy/skills
-git clone <repo-url> .workbuddy/skills/dev-loop
+git clone https://github.com/BHLO/dev_loop.git .workbuddy/skills/dev-loop
 ```
 
 > The directory name must be `dev-loop`, matching `name` in `SKILL.md`.
@@ -128,7 +128,7 @@ Judgment work (semantic impact, root cause, fix design) is driven by the playboo
 ## Contributing
 
 ```bash
-python tests/test_devloop.py     # 79 tests (behaviour / deep / rule integrity), no dependencies
+python tests/test_devloop.py     # 81 tests (behaviour / deep / rule integrity), no dependencies
 ```
 
 The most valuable contribution is adding checks for your stack to `references/impact-rules.md`.

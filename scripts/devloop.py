@@ -33,7 +33,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -108,15 +108,28 @@ def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def git(root: Path, *args: str):
+def git(root: Path, *args: str, with_stderr: bool = False):
+    """跑 git 并返回 (returncode, 输出)。
+
+    git 的失败原因几乎都在 stderr；默认只回 stdout 是为了让调用方用「输出为空」
+    判断"没变化"。push 这类需要看到失败原因的场景传 with_stderr=True。
+    """
     try:
         proc = subprocess.run(
             ["git", *args], cwd=str(root), capture_output=True,
             encoding="utf-8", errors="replace", timeout=60,
         )
-        return proc.returncode, proc.stdout.strip()
+        text = proc.stdout.strip()
+        if with_stderr and proc.returncode != 0:
+            text = "\n".join(x for x in (text, proc.stderr.strip()) if x)
+        return proc.returncode, text
     except Exception as exc:  # noqa: BLE001
         return 1, f"<git failed: {exc}>"
+
+
+def has_upstream(root: Path) -> bool:
+    rc, _ = git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    return rc == 0
 
 
 def is_git_repo(root: Path) -> bool:
@@ -1445,17 +1458,21 @@ def cmd_commit(args) -> int:
         print(f"已打标签 {args.tag}" if rc == 0 else f"打标签失败：{out}")
 
     if args.push:
-        rc, out = git(root, "push")
-        if rc != 0 and "no upstream" in (out or "").lower():
-            rc, out = git(root, "push", "-u", "origin", "HEAD")
+        # 没有 upstream 就直接建，别靠解析 stderr 判断要不要加 -u
+        if has_upstream(root):
+            rc, out = git(root, "push", with_stderr=True)
+        else:
+            rc, out = git(root, "push", "-u", "origin", "HEAD", with_stderr=True)
         if rc != 0:
-            print(f"推送失败：{out}")
+            print("推送失败：")
+            for line in (out or "（git 没给出原因）").splitlines():
+                print("  " + line)
             print("  提交已在本地，修好远程后再 git push。")
             return 1
         print("已推送。")
         if args.tag:
-            rc, out = git(root, "push", "origin", args.tag)
-            print(f"已推送标签 {args.tag}" if rc == 0 else f"推送标签失败：{out}")
+            rc, out = git(root, "push", "origin", args.tag, with_stderr=True)
+            print(f"已推送标签 {args.tag}" if rc == 0 else f"推送标签失败：\n  {out}")
     else:
         print("未推送（加 --push 才会推）。")
     return 0

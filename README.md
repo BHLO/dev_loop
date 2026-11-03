@@ -47,14 +47,14 @@ S5 修完不重跑 S2，就会漏掉修复本身引入的新影响面。
 **方式一：直接克隆（推荐，便于更新）**
 
 ```bash
-git clone <repo-url> ~/.workbuddy/skills/dev-loop
+git clone https://github.com/BHLO/dev_loop.git ~/.workbuddy/skills/dev-loop
 ```
 
 **方式二：项目内共享**（团队用同一版，随代码库分发）
 
 ```bash
 mkdir -p .workbuddy/skills
-git clone <repo-url> .workbuddy/skills/dev-loop
+git clone https://github.com/BHLO/dev_loop.git .workbuddy/skills/dev-loop
 ```
 
 **方式三：下载 zip 解压**
@@ -158,7 +158,7 @@ python scripts/devloop.py state  --root . --show
 ## 贡献
 
 ```bash
-python tests/test_devloop.py     # 79 项测试（行为 / 深度 / 规则完整性），无第三方依赖
+python tests/test_devloop.py     # 81 项测试（行为 / 深度 / 规则完整性），无第三方依赖
 ```
 
 欢迎补充 `references/impact-rules.md` 里你所在技术栈的检查项——这是最容易产生价值的地方。

@@ -589,6 +589,39 @@ class CommitGate(unittest.TestCase):
         self.assertIn("没有配置远程地址", proc.stdout)
         self.assertEqual(self._head(), before, "无远程时不该留下本地提交")
 
+    def test_push_to_bare_remote_succeeds(self) -> None:
+        """没有 upstream 时应自动 -u origin HEAD，而不是先失败再解析 stderr。"""
+        remote_dir = Path(tempfile.mkdtemp(prefix="devloop-remote-"))
+        self.addCleanup(shutil.rmtree, remote_dir, True)
+        bare = remote_dir / "r.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(bare)],
+                       capture_output=True, check=True)
+        git(self.root, "remote", "add", "origin", str(bare))
+
+        run("commit", "--root", str(self.root), "--message", "feat: 推送测试")
+        proc = run("commit", "--root", str(self.root), "--message", "feat: 推送测试",
+                   "--apply", "--push")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("已推送", proc.stdout)
+
+        log = subprocess.run(["git", "--git-dir", str(bare), "log", "--oneline"],
+                             capture_output=True, encoding="utf-8").stdout
+        self.assertIn("推送测试", log, "远程仓库应已收到提交")
+
+    def test_push_failure_shows_git_reason(self) -> None:
+        """推送失败时必须给出 git 的原始原因，不能只回一句"推送失败"。"""
+        git(self.root, "remote", "add", "origin", "Z:/no-such-repo/repo.git")
+        run("commit", "--root", str(self.root), "--message", "feat: 会失败")
+        proc = run("commit", "--root", str(self.root), "--message", "feat: 会失败",
+                   "--apply", "--push")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("推送失败", proc.stdout)
+        detail = [l for l in proc.stdout.splitlines() if l.startswith("  ") and l.strip()]
+        self.assertTrue(detail, "应输出 git 的失败原因")
+        joined = " ".join(detail).lower()
+        self.assertTrue(any(k in joined for k in ("fatal", "repository", "remote", "does not")),
+                        f"失败原因不像 git 原文：{detail}")
+
     def test_confirmed_flow_commits(self) -> None:
         run("commit", "--root", str(self.root), "--message", "feat: 加一行")
         before = self._head()
