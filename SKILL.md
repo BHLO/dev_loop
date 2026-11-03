@@ -184,6 +184,8 @@ python $DL scan  --root <root>           # 首次运行，或目录结构大改�
 | `impact --root . --files a.py,b.py` | 不依赖 git 的影响面 | S1 定位锚点后 |
 | `drift --root . --changed a.py` | 文档漂移 + 本次改动涉及的文档 | S3 |
 | `state --show / --set S2 --note "..." / --add "..." / --close N` | 阶段续做 | 每阶段收尾 |
+| `python scripts/metrics.py --root .` | 客观指标：长函数、深嵌套、参数过多、重复块、TODO 堆积 | S4 起步 |
+| `python scripts/stackmap.py --root . --log err.log` | 栈帧映射：堆栈 → 仓库内 `文件:行` + 上下文 + 抛出点 | S5 第 2 步 |
 
 输出均为 UTF-8，Windows 下用正斜杠路径。
 

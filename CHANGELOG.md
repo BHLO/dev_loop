@@ -2,6 +2,27 @@
 
 遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] - 2026-10-29
+
+补齐 S4/S5 两个阶段的客观证据工具，并为四个阶段配了显式入口命令。
+
+### 新增
+
+- **`scripts/stackmap.py`** — S5 栈帧映射：
+  - 解析 Python / JS / TS / Java / Kotlin / Go / .NET 堆栈，统一为「内层在前」
+  - 只保留落在本仓库内的帧，逐帧打印上下文（默认 ±12 行）
+  - 按异常类型在全仓搜索 `raise` / `throw` 抛出点，输出候选根因位置
+- **`scripts/metrics.py`** — S4 客观指标：
+  - Python AST 精确计算函数行数、参数个数、分支数、嵌套深度
+  - 文件级：总行数、代码行、TODO/FIXME 堆积、超长行
+  - 连续 6 行重复块检测
+  - 非 Python 语言只给文件级指标，不做假的复杂度估算
+- **四个斜杠命令**（`~/.codebuddy/commands/`）：
+  - `/impact` — 对应 S1 / S2
+  - `/sync-doc` — 对应 S3
+  - `/health` — 对应 S4
+  - `/trace` — 对应 S5
+
 ## [1.0.0] - 2026-10-27
 
 首个版本。
