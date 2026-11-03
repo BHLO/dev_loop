@@ -5,6 +5,7 @@ devloop — 研发闭环工具箱（单一入口，四阶段共用一套扫描�
 子命令:
   scan     项目画像：语言、构建/测试命令、文档清单、入口点、git 状态
   impact   变更影响面：改动文件 -> 调用方 / 测试 / 文档 / 风险分
+  graph    改造清单依赖图：清单文件之间谁依赖谁、改动会往哪传
   drift    文档漂移：文档里写的路径、符号、接口是否还存在
   state    阶段状态读写，供跨轮次续做使用
 
@@ -14,6 +15,7 @@ devloop — 研发闭环工具箱（单一入口，四阶段共用一套扫描�
   python devloop.py scan   --root .
   python devloop.py impact --root . --base HEAD~1
   python devloop.py impact --root . --files src/api/user.py,docs/api.md
+  python devloop.py graph  --root . --files src/api/user.py,src/service/order.py
   python devloop.py drift  --root .
   python devloop.py state  --root . --set S2 --note "改完 3 个文件"
 """
@@ -29,7 +31,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -692,6 +694,185 @@ def cmd_drift(args) -> int:
     return 0
 
 
+# ----------------------------------------------------------------------------- graph
+
+def collect_defs(root: Path, rel_path: str) -> list[str]:
+    """取出一个文件对外可见的符号：顶层定义 + 模块名。"""
+    text = read_text(root / rel_path, limit=400_000)
+    syms: list[str] = []
+    for m in DEF_RE.finditer(text):
+        syms.append(m.group(1))
+    stem = Path(rel_path).stem
+    if len(stem) >= 4:
+        syms.append(stem)
+
+    out, seen = [], set()
+    for s in syms:
+        if len(s) < 3 or s.startswith("_"):
+            continue
+        if s == s.lower() and s in STOPWORDS:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out[:30]
+
+
+def cmd_graph(args) -> int:
+    """把改造清单画成依赖图：谁依赖谁、改动会往哪传。"""
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+
+    if args.files:
+        targets = [x.strip() for x in args.files.split(",") if x.strip()]
+    else:
+        impact_path = out_dir / "impact.json"
+        if not impact_path.exists():
+            print("没有指定文件，也没有 impact.json。先用 impact 生成，或传 --files。")
+            return 2
+        data = json.loads(impact_path.read_text(encoding="utf-8"))
+        targets = [f["file"] for f in data["files"] if f.get("status") != "D"]
+    targets = [t for t in dict.fromkeys(targets) if (root / t).exists()]
+    if not targets:
+        print("改造清单里没有可用文件。")
+        return 2
+
+    files = [f for f in iter_files(root) if f.suffix.lower() in CODE_EXTS]
+    rels = [rel(root, f) for f in files]
+    level_of: dict[str, int] = {t: 0 for t in targets}
+    edges: dict[tuple[str, str], set[str]] = {}
+    depth = max(1, min(args.depth, 3))
+
+    # 1) 清单文件之间的互相引用（这是"关联关系"最需要看清的部分）
+    target_defs = {t: collect_defs(root, t) for t in targets}
+    for a in targets:
+        text = read_text(root / a, limit=400_000)
+        if not text:
+            continue
+        for b in targets:
+            if a == b:
+                continue
+            hits = {s for s in target_defs[b]
+                    if re.search(rf"\b{re.escape(s)}\b", text)}
+            if hits:
+                edges.setdefault((a, b), set()).update(hits)
+
+    # 2) 逐层展开外部依赖方
+    frontier = list(targets)
+    visited = set(targets)
+    for d in range(1, depth + 1):
+        sym2src: dict[str, str] = {}
+        for src in frontier:
+            for s in collect_defs(root, src):
+                sym2src.setdefault(s, src)
+        if not sym2src:
+            break
+
+        pattern = re.compile(
+            r"\b(" + "|".join(sorted(map(re.escape, sym2src), key=len, reverse=True)) + r")\b")
+        nxt: list[str] = []
+        for r in rels:
+            if r in visited:
+                continue
+            text = read_text(root / r, limit=400_000)
+            if not text:
+                continue
+            hits: set[str] = set()
+            for m in pattern.finditer(text):
+                hits.add(m.group(1))
+            if not hits:
+                continue
+            for s in hits:
+                src = sym2src[s]
+                edges.setdefault((r, src), set()).add(s)
+            level_of.setdefault(r, d)
+            visited.add(r)
+            nxt.append(r)
+        frontier = nxt
+        if not frontier:
+            break
+
+    if not edges:
+        print("没有检测到文件间的引用关系。改造清单之间可能是弱耦合，可直接按清单逐条改。")
+
+    nodes = sorted(level_of, key=lambda p: (level_of[p], p))
+    if len(nodes) > args.max_nodes:
+        keep = nodes[: args.max_nodes]
+        cut = len(nodes) - len(keep)
+        nodes = keep
+    else:
+        cut = 0
+    index = {p: f"n{i}" for i, p in enumerate(nodes)}
+
+    def label(p: str) -> str:
+        return p if len(p) <= 34 else "…" + p[-32:]
+
+    lines = ["flowchart LR"]
+    for p in nodes:
+        lines.append(f'  {index[p]}["{label(p)}"]')
+
+    shown = 0
+    for (src, dst), syms in sorted(edges.items()):
+        if src not in index or dst not in index:
+            continue
+        tag = ", ".join(sorted(syms)[:2])
+        lines.append(f'  {index[src]} -->|"{tag}"| {index[dst]}')
+        shown += 1
+
+    lines.append("  classDef target fill:#DBEAFE,stroke:#2563EB,stroke-width:2px,color:#1E3A8A")
+    lines.append("  classDef dep fill:#F8FAFC,stroke:#CBD5E1,color:#334155")
+    if targets:
+        ids = [index[t] for t in targets if t in index]
+        if ids:
+            lines.append("  class " + ",".join(ids) + " target")
+    dep_ids = [index[p] for p in nodes if p not in targets]
+    if dep_ids:
+        lines.append("  class " + ",".join(dep_ids) + " dep")
+
+    (out_dir / "graph.mmd").write_text("\n".join(lines), encoding="utf-8")
+
+    by_level: dict[int, list[str]] = {}
+    for p in nodes:
+        by_level.setdefault(level_of[p], []).append(p)
+
+    md = ["# 改造清单依赖图", "",
+          f"- 生成时间：{now()}",
+          f"- 改造文件：{len(targets)} 个",
+          f"- 关联文件：{len(nodes) - len(targets)} 个（展开 {depth} 层）", ""]
+    if cut:
+        md.append(f"> 节点过多，已按层级截断 {cut} 个；可收紧 --files 或降低 --depth。")
+        md.append("")
+    md += ["## 图", "", "```mermaid", *lines, "```", "", "## 分层", ""]
+    names = {0: "改造范围（S1 清单内）", 1: "直接受影响", 2: "间接受影响", 3: "更远"}
+    for lv in sorted(by_level):
+        md.append(f"**{names.get(lv, f'第 {lv} 层')}**（{len(by_level[lv])}）")
+        for p in by_level[lv][:40]:
+            md.append(f"- `{p}`")
+        if len(by_level[lv]) > 40:
+            md.append(f"- …… 另有 {len(by_level[lv]) - 40} 个")
+        md.append("")
+    if edges:
+        md += ["## 依赖关系", "", "| 依赖方 | 被依赖 | 引用符号 |", "|---|---|---|"]
+        for (src, dst), syms in sorted(edges.items())[:120]:
+            md.append(f"| `{src}` | `{dst}` | {', '.join(sorted(syms)[:4])} |")
+        md.append("")
+    (out_dir / "graph.md").write_text("\n".join(md), encoding="utf-8")
+
+    write_json(out_dir / "graph.json", {
+        "generated_at": now(),
+        "targets": targets,
+        "nodes": [{"file": p, "level": level_of[p]} for p in nodes],
+        "edges": [{"from": s, "to": d, "symbols": sorted(v)} for (s, d), v in edges.items()],
+        "truncated": cut,
+    })
+
+    print(f"依赖图 -> {out_dir / 'graph.md'}（{len(nodes)} 个节点，{shown} 条边）")
+    for lv in sorted(by_level):
+        print(f"  L{lv} {names.get(lv, '')}：{len(by_level[lv])} 个")
+    return 0
+
+
 # ----------------------------------------------------------------------------- state
 
 def cmd_state(args) -> int:
@@ -758,6 +939,13 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--docs", default="", help="文档列表，逗号分隔")
     d.add_argument("--changed", default="", help="本次改动的代码文件，逗号分隔")
     d.set_defaults(func=cmd_drift)
+
+    g = sub.add_parser("graph", help="改造清单依赖图")
+    g.add_argument("--root", default=".")
+    g.add_argument("--files", default="", help="改造清单文件，逗号分隔；省略则读 impact.json")
+    g.add_argument("--depth", type=int, default=1, help="向下展开层数，1-3，默认 1")
+    g.add_argument("--max-nodes", type=int, default=40, help="节点上限，默认 40")
+    g.set_defaults(func=cmd_graph)
 
     st = sub.add_parser("state", help="阶段状态")
     st.add_argument("--root", default=".")

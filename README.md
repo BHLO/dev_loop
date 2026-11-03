@@ -95,6 +95,7 @@ unzip dev-loop.zip -d ~/.workbuddy/skills/
 python scripts/devloop.py scan   --root .
 python scripts/devloop.py impact --root . --base HEAD~1
 python scripts/devloop.py impact --root . --files src/api/user.py   # 无 git 也能用
+python scripts/devloop.py graph  --root . --files src/api/user.py,src/service/order.py
 python scripts/devloop.py drift  --root . --changed src/api/user.py
 python scripts/devloop.py state  --root . --show
 ```
@@ -157,7 +158,7 @@ python scripts/devloop.py state  --root . --show
 ## 贡献
 
 ```bash
-python tests/test_devloop.py     # 9 项冒烟测试，无第三方依赖
+python tests/test_devloop.py     # 11 项冒烟测试，无第三方依赖
 ```
 
 欢迎补充 `references/impact-rules.md` 里你所在技术栈的检查项——这是最容易产生价值的地方。

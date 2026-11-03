@@ -131,6 +131,36 @@ class Fixture(unittest.TestCase):
         self.assertEqual(data["files"][0]["status"], "D")
         self.assertGreaterEqual(data["files"][0]["risk"], 60)
 
+    # --------------------------------------------------------------- graph
+
+    def test_graph_finds_dependencies(self) -> None:
+        proc = run("graph", "--root", str(self.root),
+                   "--files", "src/api/user.py", "--depth", "2")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        data = json.loads((self.root / ".devloop" / "graph.json").read_text(encoding="utf-8"))
+        edges = {(e["from"], e["to"]) for e in data["edges"]}
+        self.assertIn(("src/service/order.py", "src/api/user.py"), edges)
+
+        levels = {n["file"]: n["level"] for n in data["nodes"]}
+        self.assertEqual(levels["src/api/user.py"], 0)
+        self.assertEqual(levels["src/service/order.py"], 1)
+
+        md = (self.root / ".devloop" / "graph.md").read_text(encoding="utf-8")
+        self.assertIn("flowchart LR", md)
+        self.assertIn("改造范围", md)
+
+    def test_graph_includes_intra_target_edges(self) -> None:
+        """清单文件之间的互相依赖也要画出来。"""
+        proc = run("graph", "--root", str(self.root),
+                   "--files", "src/api/user.py,src/service/order.py")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads((self.root / ".devloop" / "graph.json").read_text(encoding="utf-8"))
+        edges = {(e["from"], e["to"]) for e in data["edges"]}
+        self.assertIn(("src/service/order.py", "src/api/user.py"), edges)
+        targets = {n["file"] for n in data["nodes"] if n["level"] == 0}
+        self.assertEqual(targets, {"src/api/user.py", "src/service/order.py"})
+
     # --------------------------------------------------------------- drift
 
     def test_drift_finds_stale_path(self) -> None:

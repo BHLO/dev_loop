@@ -84,6 +84,7 @@ Or call the CLI directly:
 ```bash
 python scripts/devloop.py scan   --root .
 python scripts/devloop.py impact --root . --base HEAD~1
+python scripts/devloop.py graph  --root . --files src/api/user.py,src/service/order.py
 python scripts/devloop.py drift  --root . --changed src/api/user.py
 python scripts/devloop.py state  --root . --show
 ```
@@ -127,7 +128,7 @@ Judgment work (semantic impact, root cause, fix design) is driven by the playboo
 ## Contributing
 
 ```bash
-python tests/test_devloop.py     # 9 smoke tests, no dependencies
+python tests/test_devloop.py     # 11 smoke tests, no dependencies
 ```
 
 The most valuable contribution is adding checks for your stack to `references/impact-rules.md`.

@@ -70,14 +70,32 @@
 | 前端 | 退款弹窗 | 是 | 金额输入框为只读 |
 
 ## 改造清单（S2 的验收标准）
-| 文件 | 动作 | 说明 |
-|---|---|---|
-| src/api/refund.py | 改 | 入参增加 amount，校验 ≤ 可退金额 |
-| src/model/refund.py | 改 | 新增 refund_amount 字段 |
-| migrations/00xx_add_refund_amount.sql | 增 | 加字段 + 默认 0 |
-| src/service/order.py | 改 | 状态机新增 PARTIAL_REFUNDED |
-| job/reconcile.py | 改 | 对账口径改按实际退款额 |
-| web/src/views/refund.vue | 改 | 金额可编辑 + 校验 |
+
+| 编号 | 文件:行 | 动作 | 改造理由 | 依据 |
+|---|---|---|---|---|
+| C1 | src/api/refund.py:42 | 改 | 入参校验写死全额，部分退款会被直接拦掉 | refund.py:42 校验分支 |
+| C2 | src/model/refund.py:15 | 改 | 缺 refund_amount 字段，部分金额无处存 | 表结构对照 |
+| C3 | migrations/0031.sql | 增 | 不迁移则新字段读出来是空，C2 白改 | C2 的依赖 |
+| C4 | src/service/order.py:88 | 改 | 状态机无 PARTIAL_REFUNDED，退款后订单状态错 | 状态枚举缺项 |
+| C5 | job/reconcile.py:88 | 改 | 对账按全额比对，部分退款会被判为差异 | 对账口径固定全额 |
+| C6 | web/src/views/refund.vue:120 | 改 | 金额输入框只读，用户无法填部分金额 | 前端 readonly |
+
+> 6 个文件，未超 8 个，单表列出。若超过 8 个改为按模块分表。
+
+## 依赖图
+
+```mermaid
+flowchart LR
+  n4["web/views/refund.vue"] -->|"refundAmount"| n0["api/refund.py"]
+  n0 -->|"RefundService"| n3["service/order.py"]
+  n0 -->|"RefundModel"| n1["model/refund.py"]
+  n1 -->|"refund_amount"| n2["migrations/0031.sql"]
+  n5["job/reconcile.py"] -->|"RefundModel"| n1
+  class n0,n1,n2,n3,n4,n5 target
+```
+
+**改动顺序**：C2 模型 → C3 迁移 → C1 接口 → C4 状态机 → C5 对账 → C6 前端。
+从被依赖最多的一端开始：模型和迁移是根，前端是叶。
 
 ## 回归范围
 | 级别 | 场景 | 理由 |
@@ -129,6 +147,75 @@ order.py:118 直接取 `.name` 未判空。批处理时段并发删除用户触�
 
 ---
 
+## 样例 D：`.devloop/S3-docs.md`（文档三分类 + 新建方案）
+
+```markdown
+# 文档同步 · 2026-11-03
+
+## 分类结果
+
+| 文档 | 分类 | 判定依据 |
+|---|---|---|
+| docs/api/refund.md | 更新 | 存在，但接口签名仍是全额退款 |
+| docs/api/order.md | 不改 | 仅提到 refund 模块名，语义未变 |
+| docs/db/refund_order.md | **新建** | 表结构变了，仓库里没有任何字段说明 |
+| CHANGELOG.md | 更新 | 需补一条 1.4.0 记录 |
+
+## 更新：docs/api/refund.md:34
+
+原文：
+> POST /api/refund  body: {order_id}
+
+新文：
+> POST /api/refund  body: {order_id, amount}
+> - amount：本次退款金额，必填，0 < amount ≤ 剩余可退金额
+> - 不传视为全额退款（兼容旧客户端）
+
+## 新建：docs/db/refund_order.md
+
+- **定位**：给后端与数据同学看的字段说明
+- **骨架**：
+  1. 表用途（一句话）
+  2. 字段表：字段 / 类型 / 是否必填 / 含义 / 备注
+  3. 状态取值
+  4. 变更记录
+- **内容要点**：
+  - 字段表含 `refund_amount decimal(12,2) not null default 0`，注明"仅部分退款场景非零"
+  - 状态取值列出 PARTIAL_REFUNDED
+  - 变更记录第一条：2026-11-03 新增 refund_amount
+- **锚点**（供 drift 检测）：`refund_amount`、`src/model/refund.py`、`PARTIAL_REFUNDED`
+
+是否创建这份文档？
+
+## 文档基线（下轮 S2 后复核）
+
+| 文档 | 关键锚点 | 本次时间 |
+|---|---|---|
+| docs/api/refund.md | `/api/refund`、`amount` | 2026-11-03 |
+| docs/db/refund_order.md | `refund_amount`、`PARTIAL_REFUNDED` | 2026-11-03 |
+```
+
+---
+
+## 样例 E：偏离清单与敏感文件记录
+
+```markdown
+## 偏离记录（附在 S2-audit.md 末尾）
+
+| 编号 | 清单原计划 | 实际 | 原因 | 用户决定 |
+|---|---|---|---|---|
+| C3 | 迁移加字段，默认 0 | 需额外回填脏数据 | 线上已有 NULL 值，默认值补不上 | 同意，拆出 C3.1 |
+| C4 | 状态机加 PARTIAL_REFUNDED | 未做 | 等产品确认能否复用 REFUNDED | 先跳过 |
+
+## 授权记录（改动敏感文件时）
+
+| 时间 | 文件 | 级别 | 用户原话 | 变更摘要 |
+|---|---|---|---|---|
+| 2026-11-03 10:12 | migrations/0031.sql | 高危 | "可以，按这个改" | 加字段 + 回填 |
+```
+
+---
+
 ## 格式红线
 
 - 每个结论后面跟 `文件:行`
@@ -136,3 +223,7 @@ order.py:118 直接取 `.name` 未判空。批处理时段并发删除用户触�
 - 没有证据的判断标注「疑似」
 - 没跑的命令标 `NOT RUN` 并附下一条可执行命令
 - 风险等级只用 高/中/低 与 P0/P1/P2，不自创分级
+- 改造清单缺「改造理由」或「依据」列 → 不合格，重写
+- 超过 8 个文件的清单平铺一页 → 不合格，改分组或分层 + 图谱
+- 跳过任何清单项却没在 S2 里标 SKIPPED → 不合格
+- 改了敏感文件却没有授权记录 → 不合格
