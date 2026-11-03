@@ -23,6 +23,7 @@ devloop — 研发闭环工具箱（单一入口，四阶段共用一套扫描�
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
@@ -33,7 +34,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.8.2"
+VERSION = "1.9.2"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -1814,22 +1815,56 @@ def cmd_gate(args) -> int:
         return 2
 
     do_skip = bool(getattr(args, "skip", False))
-    if args.show or (not args.approve and not do_skip and not args.files):
+    do_revise = bool(getattr(args, "revise", False))
+    if args.show or (not args.approve and not do_skip and not do_revise and not args.files):
         if not gates:
             print("还没有任何阶段被登记或确认。")
             return 0
-        md = ["# 阶段确认状态", "", "| 阶段 | 内容 | 状态 | 时间 | 用户原话 |", "|---|---|---|---|---|"]
+        md = ["# 阶段确认状态", "",
+              "| 阶段 | 内容 | 版本 | 状态 | 时间 | 用户原话 |", "|---|---|---|---|---|---|"]
         names = {"pending": "**待确认**", "approved": "已确认", "skipped": "不适用"}
         for st in GATE_ORDER:
             g = gates.get(st)
             if not g:
-                md.append(f"| {st} | {STAGE_TITLE[st]} | 未登记 | — | — |")
+                md.append(f"| {st} | {STAGE_TITLE[st]} | — | 未登记 | — | — |")
                 continue
-            md.append(f"| {st} | {STAGE_TITLE[st]} | {names.get(g.get('status'), '?')} | "
+            rev = f"v{g.get('revision', 1)}" if g.get("doc") else "—"
+            md.append(f"| {st} | {STAGE_TITLE[st]} | {rev} | {names.get(g.get('status'), '?')} | "
                       f"{g.get('at', '')} | {g.get('note', '') or '—'} |")
         md += ["", "> 待确认的阶段，agent 必须停下等用户点头；不许自行推进。", ""]
         (out_dir / "gates.md").write_text("\n".join(md), encoding="utf-8")
         print("\n".join(md))
+        return 0
+
+    # 三种动作互斥：同时给等于没说清要干什么
+    if sum([bool(args.approve), do_skip, do_revise]) > 1:
+        print("--approve / --skip / --revise 是三选一的动作，一次只能给一个。")
+        return 2
+
+    # ---------------- 用户提了意见：退回待确认，等改完再确认
+    if getattr(args, "revise", False):
+        g = gates.get(stage)
+        if not g:
+            print(f"{stage} 还没有登记过，没有可改的方案。")
+            print(f"  先登记：gate --stage {stage} --files a.py --doc <报告>")
+            return 2
+        if not args.note.strip():
+            print("--revise 必须带 --note：原样记下用户的意见，不要自己概括。")
+            return 2
+
+        prev_rev = int(g.get("revision", 1) or 1)
+        next_rev = prev_rev + 1
+        g.setdefault("revisions", []).append(
+            {"at": now(), "revision": next_rev, "note": args.note.strip(),
+             "status_before": g.get("status")})
+        g["status"] = "pending"
+        g["note"] = ""
+        gates[stage] = g
+        write_json(gates_path(root), gates)
+
+        print(f"{stage}（{STAGE_TITLE[stage]}）已退回待确认，接下来是第 {next_rev} 版。")
+        print(f"  用户意见：{args.note.strip()}")
+        print("  顺序：按意见改报告 → `gate` 重新登记 → 贴给用户 → 他再确认 → 才能进下一阶段。")
         return 0
 
     # ---------------- 批准 / 跳过
@@ -1853,6 +1888,11 @@ def cmd_gate(args) -> int:
         if not g:
             print(f"{stage} 还没有登记过，没有可确认的清单。")
             print(f"  先登记：gate --stage {stage} --files a.py,b.py --doc <报告>")
+            return 2
+        # 已经出了方案就说明这个阶段适用，不能顺手标成"不适用"绕过去
+        if do_skip and g.get("doc"):
+            print(f"{stage} 已经出过产出（{g['doc']}），不能标成不适用。")
+            print("  方案作废请走 `--revise --note \"为什么作废\"` 留下记录，再重新登记或确认。")
             return 2
         if g.get("status") == "approved":
             print(f"{stage} 已经确认过（{g.get('at')}），无需重复确认。")
@@ -1911,32 +1951,82 @@ def cmd_gate(args) -> int:
         print(f"  用户要过目的是 {stage} 的完整产出，不是几个空标题。补齐后再登记。")
         return 2
 
+    # ---- 版本与改动：报告每次变，就是新一版；没变就不虚增版本号
+    prev = gates.get(stage) or {}
+    cur_sha = doc_sha(doc_path)
+    same_doc = bool(prev) and prev.get("doc_sha") == cur_sha
+    prev_rev = int(prev.get("revision", 0) or 0)
+
+    # 用户提过意见、却拿原封不动的报告重新登记 —— 意见没落实，不许糊弄过去
+    last_note = (prev.get("revisions") or [{}])[-1]
+    if same_doc and prev.get("status") == "pending" and last_note.get("revision", 0) > prev_rev:
+        print(f"{stage} 的报告和上一版一模一样，用户提的意见还没落实到方案里。")
+        print(f"  待落实的意见：{last_note.get('note', '')}")
+        print("  改完报告再登记；如果意见是「不用改」，就用 --approve 时说明理由。")
+        return 2
+
+    rev = prev_rev if same_doc else prev_rev + 1
+    if rev == 0:
+        rev = 1
+
+    snap_dir = out_dir / "revisions"
+    snap_dir.mkdir(exist_ok=True)
+    diff_lines: list[str] = []
+    if not same_doc and prev_rev:
+        prev_snap = snap_dir / f"{stage}-v{prev_rev}.md"
+        if prev_snap.exists():
+            old_text = read_text(prev_snap, limit=1_000_000)
+            diff_lines = list(difflib.unified_diff(
+                old_text.splitlines(), text.splitlines(),
+                fromfile=f"v{prev_rev}", tofile=f"v{rev}", lineterm="", n=1))
+    (snap_dir / f"{stage}-v{rev}.md").write_text(text, encoding="utf-8")
+
     signature = gate_sig(files, doc_path)
+    revisions = prev.get("revisions", []) if prev else []
     gates[stage] = {
         "at": now(), "status": "pending", "summary": args.summary or "",
         "files": sorted(files), "doc": rel(root, doc_path), "signature": signature,
-        "note": "",
+        "note": "", "revision": rev, "doc_sha": cur_sha, "revisions": revisions,
     }
     write_json(gates_path(root), gates)
 
-    md = [f"# {stage} · {STAGE_TITLE[stage]}（待用户确认）", "",
+    md = [f"# {stage} · {STAGE_TITLE[stage]}（第 {rev} 版 · 待用户确认）", "",
           f"- 登记时间：{gates[stage]['at']}",
           f"- 说明：{gates[stage]['summary'] or '（未填）'}",
           f"- 报告：`{gates[stage]['doc']}`",
           f"- 文件数：{len(files)}",
-          f"- 指纹：`{signature}`", "",
-          "## 清单覆盖的文件", "", "| 文件 |", "|---|"]
+          f"- 指纹：`{signature}`", ""]
+
+    if revisions:
+        md += ["## 你提过的意见", "", "| 第几版 | 时间 | 意见原话 |", "|---|---|---|"]
+        for r in revisions:
+            md.append(f"| v{r.get('revision', '?')} | {r.get('at', '')} | {r.get('note', '')} |")
+        md.append("")
+
+    if diff_lines:
+        shown = [d for d in diff_lines if d.startswith(("+", "-")) and not d.startswith(("+++", "---"))]
+        md += [f"## 本版改了什么（v{prev_rev} → v{rev}，共 {len(shown)} 行变化）", "", "```diff"]
+        md += diff_lines[:60]
+        if len(diff_lines) > 60:
+            md.append(f"... 还有 {len(diff_lines) - 60} 行，见 .devloop/revisions/")
+        md += ["```", ""]
+
+    md += ["## 清单覆盖的文件", "", "| 文件 |", "|---|"]
     for f in sorted(files):
         md.append(f"| `{f}` |")
     md += ["", "## 确认流程", "",
            f"1. 把 `{gates[stage]['doc']}` 全文贴给用户（不是只贴文件名）",
            "2. **停下来等**，不许继续做下一阶段",
            f"3. 用户明确同意后：`gate --stage {stage} --approve --note \"用户原话\"`",
-           "4. 这个阶段不适用时：`gate --stage " + stage + " --skip --note \"为什么不需要\"`",
-           f"5. 然后才能 `state --set {GATE_ORDER[min(GATE_ORDER.index(stage) + 1, 5)]}`", ""]
+           f"4. 用户提了意见：`gate --stage {stage} --revise --note \"意见原话\"`，改完再登记",
+           "5. 这个阶段不适用时：`gate --stage " + stage + " --skip --note \"为什么不需要\"`",
+           f"6. 然后才能 `state --set {GATE_ORDER[min(GATE_ORDER.index(stage) + 1, 5)]}`", ""]
     (out_dir / f"{stage}-gate.md").write_text("\n".join(md), encoding="utf-8")
 
-    print(f"{stage} 已登记待确认 -> {out_dir / f'{stage}-gate.md'}（{len(files)} 个文件）")
+    tag = f"第 {rev} 版" + (f"，改动 {len([d for d in diff_lines if d.startswith(('+', '-'))])} 行" if diff_lines else "")
+    print(f"{stage} 已登记待确认 -> {out_dir / f'{stage}-gate.md'}（{len(files)} 个文件，{tag}）")
+    if revisions:
+        print(f"  已记录你提过的 {len(revisions)} 条意见，报告里逐条对应。")
     if stage == "S1":
         print("  贴之前自查：技术路线是否 ≥2 条、有没有写淘汰理由、架构图是否只画了本次改动相关部分。")
     print(f"  下一步：把 {gates[stage]['doc']} 贴给用户，等他明确同意后再 gate --stage {stage} --approve --note ...")
@@ -2045,24 +2135,52 @@ def cmd_state(args) -> int:
     state.setdefault("open_items", [])
     state.setdefault("created_at", now())
 
+    # 阶段名统一归一化：`--set s2` 曾经能绕过整道门（不匹配 S2，直接写进 state）
+    if args.set:
+        normalized = args.set.strip().upper()
+        if normalized not in GATE_ORDER and normalized != "IDLE":
+            print(f"未知阶段 {args.set}，可选：{'、'.join(GATE_ORDER)} 或 IDLE")
+            return 2
+        args.set = normalized
+
+    # --round 是重置，--set 是跳阶段；一起给等于清空记录的同时跳过去
+    if args.round and args.set:
+        print("--round 和 --set 不能同时给。")
+        print("  开新一轮：state --round <需求名>（会回到 S1）")
+        print(f"  进入阶段：`state --set {args.set}`（需要上一阶段已确认）")
+        return 2
+
     if args.set in PREV_STAGE:
-        prev = PREV_STAGE[args.set]
-        g = load_gates(root).get(prev)
-        if not g:
-            print(f"不能进入 {args.set}：{prev}（{STAGE_TITLE[prev]}）还没登记过。")
-            print(f"  1) 先把 {prev} 的产出写成报告")
-            print(f"  2) 登记：gate --stage {prev} --files a.py,b.py --doc <报告>")
-            print(f"  3) 把报告贴给用户看，等他明确同意")
-            print(f"  4) 用户同意后：gate --stage {prev} --approve --note \"用户原话\"")
-            return 3
-        if g.get("status") == "pending":
-            print(f"不能进入 {args.set}：{prev}（{STAGE_TITLE[prev]}）的清单还没给用户确认过。")
-            print(f"  清单在 {rel(root, root / g['doc'])}，先贴给用户，等他点头。")
-            print(f"  用户不认同的处理：改清单 → 重新登记 → 再看一次。")
-            return 3
-        if g.get("status") not in ("approved", "skipped"):
-            print(f"不能进入 {args.set}：{prev} 的状态异常（{g.get('status')}）。")
-            return 3
+        # 检查整条链，不只看上一级：S1 没确认就批 S2，进 S3 时也要拦住
+        gates_all = load_gates(root)
+        for st in GATE_ORDER[:GATE_ORDER.index(args.set)]:
+            g = gates_all.get(st)
+            if not g:
+                print(f"不能进入 {args.set}：{st}（{STAGE_TITLE[st]}）还没登记过。")
+                print(f"  1) 先把 {st} 的产出写成报告")
+                print(f"  2) 登记：gate --stage {st} --files a.py,b.py --doc <报告>")
+                print(f"  3) 把报告贴给用户看，等他明确同意")
+                print(f"  4) 用户同意后：gate --stage {st} --approve --note \"用户原话\"")
+                print(f"  这个阶段不适用：gate --stage {st} --skip --note \"为什么不需要\"")
+                return 3
+            if g.get("status") == "pending":
+                print(f"不能进入 {args.set}：{st}（{STAGE_TITLE[st]}）的清单还没给用户确认过。")
+                print(f"  清单在 {rel(root, root / g['doc'])}，先贴给用户，等他点头。")
+                print(f"  用户不认同的处理：改清单 → 重新登记 → 再看一次。")
+                return 3
+            if g.get("status") not in ("approved", "skipped"):
+                print(f"不能进入 {args.set}：{st} 的状态异常（{g.get('status')}）。")
+                return 3
+
+            # 用户确认之后报告又被改过——他看过的那版已经不是现在这版，必须重新确认
+            if g.get("status") == "approved" and g.get("doc"):
+                doc = root / g["doc"]
+                cur = gate_sig(g.get("files", []), doc)
+                if cur != g.get("signature"):
+                    print(f"不能进入 {args.set}：{st}（{STAGE_TITLE[st]}）的报告在你确认之后又被改过。")
+                    print(f"  报告：{g['doc']}")
+                    print("  你确认的是上一版，现在这份不是同一份。重新登记并贴给用户，再确认一次。")
+                    return 3
 
     if args.round:
         archived = state.get("open_items", [])
@@ -2200,6 +2318,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--doc", default="", help="本阶段报告文件，默认 .devloop/<阶段>-gate.md")
     g.add_argument("--summary", default="", help="一句话说明")
     g.add_argument("--approve", action="store_true", help="用户确认后标记为已确认")
+    g.add_argument("--revise", action="store_true",
+                   help="用户提了意见：退回待确认，记下意见，改完重新登记")
     g.add_argument("--skip", action="store_true", help="本阶段不适用（也要给原话）")
     g.add_argument("--note", default="", help="用户原话，确认或跳过时必填")
     g.add_argument("--show", action="store_true", help="查看各阶段确认状态")
