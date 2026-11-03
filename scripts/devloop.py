@@ -32,7 +32,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -734,10 +734,11 @@ def cmd_graph(args) -> int:
             return 2
         data = json.loads(impact_path.read_text(encoding="utf-8"))
         targets = [f["file"] for f in data["files"] if f.get("status") != "D"]
-    targets = [t for t in dict.fromkeys(targets) if (root / t).exists()]
+    targets = list(dict.fromkeys(targets))
     if not targets:
         print("改造清单里没有可用文件。")
         return 2
+    missing = [t for t in targets if not (root / t).exists()]
 
     files = [f for f in iter_files(root) if f.suffix.lower() in CODE_EXTS]
     rels = [rel(root, f) for f in files]
@@ -823,6 +824,10 @@ def cmd_graph(args) -> int:
 
     lines.append("  classDef target fill:#DBEAFE,stroke:#2563EB,stroke-width:2px,color:#1E3A8A")
     lines.append("  classDef dep fill:#F8FAFC,stroke:#CBD5E1,color:#334155")
+    lines.append("  classDef newone fill:#FFFBEB,stroke:#F59E0B,stroke-dasharray:5 3,color:#92400E")
+    new_ids = [index[m] for m in missing if m in index]
+    if new_ids:
+        lines.append("  class " + ",".join(new_ids) + " newone")
     if targets:
         ids = [index[t] for t in targets if t in index]
         if ids:
@@ -843,6 +848,11 @@ def cmd_graph(args) -> int:
           f"- 关联文件：{len(nodes) - len(targets)} 个（展开 {depth} 层）", ""]
     if cut:
         md.append(f"> 节点过多，已按层级截断 {cut} 个；可收紧 --files 或降低 --depth。")
+        md.append("")
+    if missing:
+        md.append("> 以下文件尚未在仓库中，按**待新建**处理（图中为虚线）：")
+        for m in missing:
+            md.append(f"> - `{m}`")
         md.append("")
     md += ["## 图", "", "```mermaid", *lines, "```", "", "## 分层", ""]
     names = {0: "改造范围（S1 清单内）", 1: "直接受影响", 2: "间接受影响", 3: "更远"}
@@ -869,6 +879,8 @@ def cmd_graph(args) -> int:
     })
 
     print(f"依赖图 -> {out_dir / 'graph.md'}（{len(nodes)} 个节点，{shown} 条边）")
+    if missing:
+        print(f"  待新建 {len(missing)} 个：" + "、".join(missing))
     for lv in sorted(by_level):
         print(f"  L{lv} {names.get(lv, '')}：{len(by_level[lv])} 个")
     return 0
@@ -898,18 +910,30 @@ SELFTEST_RULES = [
 ]
 
 SENSITIVE_PATTERNS = [
-    ("高危", r"(^|/)(migrations?|alembic/versions)/"),
-    ("高危", r"\.(sql|pem|key|p12|jks)$"),
-    ("高危", r"(^|/)\.env"),
-    ("高危", r"(\.github/workflows/|\.gitlab-ci\.yml|Jenkinsfile|azure-pipelines)"),
-    ("高危", r"(^|/)(auth|security)/|(permission|rbac|acl)"),
-    ("高危", r"(prod|production)[\w.-]*\.(ya?ml|properties|env)$"),
-    ("高危", r"(^|/)(deploy|release|rollback)"),
-    ("高危", r"(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|poetry\.lock|go\.sum|Cargo\.lock)"),
-    ("中危", r"(^|/)(common|utils|core|shared|lib)/"),
-    ("中危", r"(package\.json|pom\.xml|requirements\.txt|pyproject\.toml|go\.mod|Cargo\.toml)$"),
-    ("中危", r"(Dockerfile|docker-compose|(^|/)k8s/|(^|/)helm/)"),
+    ("高危", "数据库迁移", r"(^|/)(migrations?|alembic/versions)/"),
+    ("高危", "SQL 脚本", r"\.sql$"),
+    ("高危", "密钥/证书", r"\.(pem|key|p12|jks)$"),
+    ("高危", "环境配置", r"(^|/)\.env"),
+    ("高危", "CI/CD", r"(\.github/workflows/|\.gitlab-ci\.yml|Jenkinsfile|azure-pipelines)"),
+    ("高危", "权限鉴权", r"(^|/)(auth|security)/|(permission|rbac|acl)"),
+    ("高危", "生产配置", r"(prod|production)[\w.-]*\.(ya?ml|properties|env)$"),
+    ("高危", "发布脚本", r"(^|/)(deploy|release|rollback)"),
+    ("高危", "依赖锁文件", r"(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|poetry\.lock|go\.sum|Cargo\.lock)"),
+    ("中危", "公共基础库", r"(^|/)(common|utils|core|shared|lib)/"),
+    ("中危", "依赖清单", r"(package\.json|pom\.xml|requirements\.txt|pyproject\.toml|go\.mod|Cargo\.toml)$"),
+    ("中危", "容器与编排", r"(Dockerfile|docker-compose|(^|/)k8s/|(^|/)helm/)"),
 ]
+
+
+def classify_sensitive(files: list[str]) -> list[dict]:
+    """返回 [{file, level, label}]，按清单顺序取第一个命中。"""
+    out = []
+    for f in files:
+        for level, label, pat in SENSITIVE_PATTERNS:
+            if re.search(pat, f, re.IGNORECASE):
+                out.append({"file": f, "level": level, "label": label})
+                break
+    return out
 
 
 def git_status_entries(root: Path) -> list[dict]:
@@ -946,6 +970,17 @@ def build_selftest_checklist(files: list[str]) -> list[dict]:
         seen.add(scene)
         rows.append({"scene": scene, "how": how, "file": f})
     return rows[:8]
+
+
+ENV_ERROR_RE = re.compile(
+    r"(No module named|ModuleNotFoundError|command not found|"
+    r"不是内部或外部命令|ENOENT|No such file or directory|"
+    r"cannot find (the )?path|is not recognized as)", re.IGNORECASE)
+
+
+def looks_like_env_error(text: str) -> bool:
+    """跑不起来 ≠ 测试没过。环境问题不能算代码失败。"""
+    return bool(ENV_ERROR_RE.search(text))
 
 
 def parse_test_summary(text: str) -> dict:
@@ -1006,11 +1041,19 @@ def cmd_verify(args) -> int:
 
     ok = code == 0
     summary = parse_test_summary(output)
+    env_issue = (not ok) and looks_like_env_error(output)
+    verdict = "通过" if ok else ("NOT RUN（环境问题）" if env_issue else "未通过")
+
     md += ["## 结果", "",
            f"- 命令：`{cmd}`",
            f"- 退出码：{code}" + (f"（{note}）" if note else ""),
            f"- 耗时：{elapsed}s",
-           f"- 结论：**{'通过' if ok else '未通过'}**", ""]
+           f"- 结论：**{verdict}**", ""]
+    if env_issue:
+        md += ["命令没跑起来，不代表代码有问题。先解决环境：", "",
+               "- 确认测试框架已安装（`pip install pytest` / `npm i` / `go mod download`）",
+               "- 确认命令在项目根目录可执行",
+               f"- 排查后重跑：`python scripts/devloop.py verify --root . --cmd \"{cmd}\"`", ""]
     if summary["passed"] or summary["failed"]:
         md += [f"- 用例：通过 {summary['passed']} / 失败 {summary['failed']} / 跳过 {summary['skipped']}", ""]
     if summary["failures"]:
@@ -1028,9 +1071,11 @@ def cmd_verify(args) -> int:
     md += ["## 输出尾部（最后 40 行）", "", "```", *tail, "```", ""]
 
     (out_dir / "verify.md").write_text("\n".join(md), encoding="utf-8")
-    print(f"验证 -> {out_dir / 'verify.md'}（{'通过' if ok else '未通过'}，退出码 {code}，{elapsed}s）")
+    print(f"验证 -> {out_dir / 'verify.md'}（{verdict}，退出码 {code}，{elapsed}s）")
     print(f"  自测清单 {len(checklist)} 项，已写入报告")
-    return 0 if ok else 1
+    if ok:
+        return 0
+    return 2 if env_issue else 1
 
 
 # ----------------------------------------------------------------------------- commit
@@ -1096,12 +1141,7 @@ def cmd_commit(args) -> int:
         top = e["file"].split("/")[0] if "/" in e["file"] else "(根目录)"
         groups.setdefault(top, []).append(e)
 
-    sensitive = []
-    for e in entries:
-        for level, pat in SENSITIVE_PATTERNS:
-            if re.search(pat, e["file"], re.IGNORECASE):
-                sensitive.append({"file": e["file"], "level": level})
-                break
+    sensitive = classify_sensitive([e["file"] for e in entries])
 
     deleted = [e["file"] for e in entries if "D" in e["status"]]
     major_reasons = []
@@ -1145,9 +1185,9 @@ def cmd_commit(args) -> int:
     md.append("")
 
     if sensitive:
-        md += ["## 敏感文件提醒", "", "| 级别 | 文件 |", "|---|---|"]
+        md += ["## 敏感文件提醒", "", "| 级别 | 类别 | 文件 |", "|---|---|---|"]
         for s in sensitive:
-            md.append(f"| {s['level']} | `{s['file']}` |")
+            md.append(f"| {s['level']} | {s['label']} | `{s['file']}` |")
         md += ["", "高危文件需逐个确认已获授权，见 `references/sensitive-files.md`。", ""]
     else:
         md += ["## 敏感文件提醒", "", "无。", ""]
@@ -1190,6 +1230,137 @@ def cmd_commit(args) -> int:
     else:
         print("（仅生成清单，未提交。确认后加 --apply --message \"...\" 执行）")
     return 0
+
+
+# ----------------------------------------------------------------------------- sensitive
+
+def cmd_sensitive(args) -> int:
+    """清单定稿时先扫一遍：哪些文件动之前需要用户授权。"""
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+
+    files = [x.strip() for x in args.files.split(",") if x.strip()] if args.files else []
+    if not files:
+        files = [e["file"] for e in git_status_entries(root)]
+    if not files:
+        print("没有可检查的文件。用 --files 指定清单里的文件。")
+        return 0
+
+    hits = classify_sensitive(files)
+    high = [h for h in hits if h["level"] == "高危"]
+    mid = [h for h in hits if h["level"] == "中危"]
+
+    md = ["# 敏感文件预检", "", f"- 生成时间：{now()}",
+          f"- 检查文件：{len(files)} 个",
+          f"- 需授权：{len(hits)} 个（高危 {len(high)} / 中危 {len(mid)}）", ""]
+    if hits:
+        md += ["| 级别 | 类别 | 文件 | 确认方式 |", "|---|---|---|---|"]
+        for h in hits:
+            how = "逐文件单独确认" if h["level"] == "高危" else "可批量确认一次"
+            md.append(f"| {h['level']} | {h['label']} | `{h['file']}` | {how} |")
+        md += ["", "把这些项写进 S1 的「待确认项」，改动前先拿到明确同意。", ""]
+    else:
+        md += ["无敏感文件，按清单直接改。", ""]
+    (out_dir / "sensitive.md").write_text("\n".join(md), encoding="utf-8")
+
+    print(f"敏感预检 -> {out_dir / 'sensitive.md'}（需授权 {len(hits)}：高危 {len(high)} / 中危 {len(mid)}）")
+    for h in hits:
+        print(f"  {h['level']}  {h['label']}  {h['file']}")
+    if high:
+        return 3
+    if mid:
+        return 4
+    return 0
+
+
+# ----------------------------------------------------------------------------- audit
+
+PLAN_PATH_RE = re.compile(
+    r"([\w./\\-]+\.(?:py|pyi|js|mjs|cjs|ts|tsx|jsx|vue|java|kt|go|rs|cs|cpp|cc|h|php|"
+    r"rb|swift|scala|sql|md|rst|ya?ml|json|xml|toml|gradle|sh|ps1))")
+
+
+def cmd_audit(args) -> int:
+    """把 state 里的改造清单和实际 diff 对账：漏改 / 越界。"""
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+
+    state_path = out_dir / "state.json"
+    items = []
+    if state_path.exists():
+        try:
+            items = json.loads(state_path.read_text(encoding="utf-8")).get("open_items", [])
+        except Exception:
+            items = []
+    planned: dict[str, list[str]] = {}
+    for it in items:
+        if it.get("done"):
+            continue
+        m = PLAN_PATH_RE.search(it.get("item", ""))
+        if m:
+            planned.setdefault(m.group(1).replace("\\", "/"), []).append(it["item"])
+
+    base = args.base
+    rc, diff = git(root, "diff", "--name-status", base)
+    if rc != 0:
+        print(f"git diff 失败：{diff}")
+        return 2
+    changed: dict[str, str] = {}
+    for line in diff.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            changed[parts[-1]] = parts[0][0]
+    for e in git_status_entries(root):          # 新建文件还没被跟踪，diff 里看不到
+        changed.setdefault(e["file"], "A" if "?" in e["status"] else e["status"])
+
+    def is_doc(path: str) -> bool:
+        low = path.lower()
+        return low.startswith(("docs/", "doc/", "documentation/")) or low.endswith((".md", ".rst", ".adoc"))
+
+    scope = getattr(args, "scope", "code")
+    if scope != "all":
+        want_doc = scope == "docs"
+        planned = {p: v for p, v in planned.items() if is_doc(p) == want_doc}
+        changed = {p: v for p, v in changed.items() if is_doc(p) == want_doc}
+
+    missing = [p for p in planned if p not in changed]
+    extra = [p for p in changed if p not in planned]
+    both = [p for p in planned if p in changed]
+
+    scope_name = {"code": "代码", "docs": "文档", "all": "全部"}.get(scope, scope)
+    md = ["# 变更审计对账", "", f"- 生成时间：{now()}",
+          f"- 对比基线：{base}",
+          f"- 对账范围：{scope_name}",
+          f"- 计划文件：{len(planned)} 个（来自 state.open_items）",
+          f"- 实际变更：{len(changed)} 个文件", ""]
+    if not items:
+        md += ["> state 里没有未闭环项，无法对账。S1 结束后请用 `state --add` 录入清单。", ""]
+
+    md += ["## 漏改（计划里有、diff 里没有）", ""]
+    if missing:
+        for p in missing:
+            md.append(f"- `{p}`　← {'；'.join(planned[p])[:80]}")
+    else:
+        md.append("无")
+    md += ["", "## 越界（diff 里有、计划里没有）", ""]
+    if extra:
+        for p in extra:
+            flag = "（新增文件）" if changed[p] == "A" else ""
+            md.append(f"- `{p}` {flag}")
+    else:
+        md.append("无")
+    md += ["", "## 一致", ""]
+    md += [f"- `{p}`（{changed[p]}）" for p in both] or ["无"]
+    md += ["", "> 漏改不等于必须改：确认后可以把该项标为 SKIPPED 并写明原因。", ""]
+
+    fname = "audit.md" if scope == "all" else f"audit-{scope}.md"
+    (out_dir / fname).write_text("\n".join(md), encoding="utf-8")
+    print(f"对账 -> {out_dir / fname}（漏改 {len(missing)} / 越界 {len(extra)} / 一致 {len(both)}）")
+    for p in missing:
+        print(f"  漏改：{p}")
+    for p in extra:
+        print(f"  越界：{p}")
+    return 1 if missing else 0
 
 
 # ----------------------------------------------------------------------------- state
@@ -1273,6 +1444,18 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--timeout", type=int, default=900, help="超时秒数，默认 900")
     v.add_argument("--dry-run", action="store_true", help="只显示将执行的命令")
     v.set_defaults(func=cmd_verify)
+
+    se = sub.add_parser("sensitive", help="敏感文件预检")
+    se.add_argument("--root", default=".")
+    se.add_argument("--files", default="", help="清单里的文件，逗号分隔；省略则取工作区改动")
+    se.set_defaults(func=cmd_sensitive)
+
+    au = sub.add_parser("audit", help="清单与 diff 对账")
+    au.add_argument("--root", default=".")
+    au.add_argument("--base", default="HEAD", help="对比基线，默认 HEAD")
+    au.add_argument("--scope", choices=["code", "docs", "all"], default="code",
+                    help="对账范围：code 只对代码项（S2），docs 只对文档项（S3），默认 code")
+    au.set_defaults(func=cmd_audit)
 
     c = sub.add_parser("commit", help="生成提交清单（默认不提交）")
     c.add_argument("--root", default=".")

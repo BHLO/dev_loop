@@ -232,6 +232,83 @@ class Fixture(unittest.TestCase):
                               capture_output=True, encoding="utf-8").stdout
         self.assertIn("v9.9.9", tags)
 
+    # --------------------------------------------------------------- audit
+
+    def test_audit_reports_missing_and_extra(self) -> None:
+        run("state", "--root", str(self.root), "--set", "S1")
+        run("state", "--root", str(self.root), "--add", "C1 | src/api/user.py | 改 | 加参数")
+        run("state", "--root", str(self.root), "--add", "C2 | src/service/order.py | 改 | 透传")
+        (self.root / "src" / "api" / "user.py").write_text(
+            "def get_user(user_id):\n    return {'id': user_id}\n\ndef extra():\n    return 1\n",
+            encoding="utf-8")
+        (self.root / "stray.py").write_text("x = 1\n", encoding="utf-8")
+
+        proc = run("audit", "--root", str(self.root), "--base", "HEAD")
+        self.assertEqual(proc.returncode, 1)
+        md = (self.root / ".devloop" / "audit-code.md").read_text(encoding="utf-8")
+        self.assertIn("src/service/order.py", md)      # 漏改
+        self.assertIn("stray.py", md)                  # 越界
+        self.assertIn("src/api/user.py", md)           # 一致
+
+    def test_audit_counts_untracked_new_file(self) -> None:
+        run("state", "--root", str(self.root), "--set", "S1")
+        run("state", "--root", str(self.root), "--add",
+            "C1 | migrations/0001.sql | 增 | 加字段")
+        (self.root / "migrations").mkdir(exist_ok=True)
+        (self.root / "migrations" / "0001.sql").write_text("ALTER TABLE t ADD c INT;\n",
+                                                           encoding="utf-8")
+        proc = run("audit", "--root", str(self.root), "--base", "HEAD")
+        self.assertEqual(proc.returncode, 0, proc.stdout)   # 新建文件算已改
+        md = (self.root / ".devloop" / "audit-code.md").read_text(encoding="utf-8")
+        self.assertNotIn("漏改（计划里有", md.split("## 一致")[0].replace("## 漏改（计划里有、diff 里没有）", ""))
+
+    def test_audit_docs_scope_excludes_code(self) -> None:
+        run("state", "--root", str(self.root), "--set", "S3")
+        run("state", "--root", str(self.root), "--add", "C9 | docs/api.md | 改 | 补字段")
+        (self.root / "src" / "api" / "user.py").write_text("def x():\n    return 2\n",
+                                                           encoding="utf-8")
+        proc = run("audit", "--root", str(self.root), "--base", "HEAD", "--scope", "docs")
+        self.assertEqual(proc.returncode, 1)
+        md = (self.root / ".devloop" / "audit-docs.md").read_text(encoding="utf-8")
+        self.assertIn("docs/api.md", md)
+        self.assertNotIn("src/api/user.py", md.split("## 一致")[0])
+
+    # ----------------------------------------------------------- sensitive
+
+    def test_sensitive_levels(self) -> None:
+        proc = run("sensitive", "--root", str(self.root), "--files",
+                   "migrations/0001.sql,src/common/money.py,src/api/user.py")
+        self.assertEqual(proc.returncode, 3)          # 有高危
+        md = (self.root / ".devloop" / "sensitive.md").read_text(encoding="utf-8")
+        self.assertIn("高危", md)
+        self.assertIn("中危", md)
+        self.assertIn("migrations/0001.sql", md)
+
+    def test_sensitive_clean_returns_zero(self) -> None:
+        proc = run("sensitive", "--root", str(self.root), "--files", "src/api/user.py")
+        self.assertEqual(proc.returncode, 0)
+
+    # --------------------------------------------------------------- graph
+
+    def test_graph_keeps_missing_targets(self) -> None:
+        proc = run("graph", "--root", str(self.root), "--files",
+                   "src/api/user.py,migrations/0009_new.sql")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads((self.root / ".devloop" / "graph.json").read_text(encoding="utf-8"))
+        files = {n["file"]: n["level"] for n in data["nodes"]}
+        self.assertIn("migrations/0009_new.sql", files)   # 待新建不被丢弃
+        self.assertEqual(files["migrations/0009_new.sql"], 0)
+        md = (self.root / ".devloop" / "graph.md").read_text(encoding="utf-8")
+        self.assertIn("待新建", md)
+
+    def test_verify_env_error_is_not_failure(self) -> None:
+        (self.root / "env_fail.py").write_text("import no_such_module_xyz\n", encoding="utf-8")
+        proc = run("verify", "--root", str(self.root),
+                   "--cmd", f'"{sys.executable}" env_fail.py')
+        self.assertEqual(proc.returncode, 2)
+        md = (self.root / ".devloop" / "verify.md").read_text(encoding="utf-8")
+        self.assertIn("环境问题", md)
+
     # --------------------------------------------------------------- drift
 
     def test_drift_finds_stale_path(self) -> None:
