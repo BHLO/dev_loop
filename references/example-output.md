@@ -216,6 +216,99 @@ order.py:118 直接取 `.name` 未判空。批处理时段并发删除用户触�
 
 ---
 
+## 样例 F：`.devloop/verify.md`（验证 + 自测清单）
+
+```markdown
+# 验证报告
+
+- 命令：`pytest -q`
+- 退出码：0
+- 耗时：18.4s
+- 结论：**通过**
+- 用例：通过 42 / 失败 0 / 跳过 3
+
+## 建议用户自测清单
+
+| ✓ | 场景 | 怎么测 | 涉及文件 |
+|---|---|---|---|
+| □ | 接口调用 | 正常入参 / 缺参 / 越权 / 不存在的 id | `src/api/refund.py` |
+| □ | 数据库迁移 | 开发库执行一遍，再回滚一次，确认可重复执行 | `migrations/0031.sql` |
+| □ | 页面操作 | 打开退款弹窗，填部分金额，看校验与提示 | `web/views/refund.vue` |
+```
+
+交给用户时必须带上这段话，不能只说"测试通过"：
+
+> 自动化覆盖了 42 个用例，但边界和交互还得你手工过一遍。
+
+## 样例 G：`.devloop/commit-plan.md`（提交清单）
+
+```markdown
+# 提交清单（待确认）
+
+- 文件数：12（+340 / -86）
+- 分支：feat/partial-refund
+- 当前 HEAD：a1b2c3d
+
+## 提交内容
+
+| 状态 | 文件 | 增/删 |
+|---|---|---|
+| | **migrations**（1） | |
+| A | `migrations/0031_add_refund_amount.sql` | +18/-0 |
+| | **src**（5） | |
+| M | `src/api/refund.py` | +64/-22 |
+| M | `src/model/refund.py` | +12/-3 |
+| | **docs**（3） | |
+| M | `docs/api/refund.md` | +26/-8 |
+| A | `docs/db/refund_order.md` | +58/-0 |
+
+## 敏感文件提醒
+
+| 级别 | 文件 |
+|---|---|
+| 高危 | `migrations/0031_add_refund_amount.sql` |
+
+## 建议提交信息
+
+​```
+feat(refund): 支持部分退款
+
+- 退款接口接受 amount，校验不超过剩余可退金额
+- 新增 refund_order.refund_amount 字段与迁移
+- 订单状态机新增 PARTIAL_REFUNDED
+​```
+
+## 是否重大改动
+
+**是**：涉及高危文件：migrations/0031_add_refund_amount.sql；增减 426 行（≥300）
+建议打标签：`v1.4.0`
+
+## 确认项
+
+- [ ] 文件清单无误，没有遗漏或多带
+- [ ] 提交信息描述准确
+- [ ] 验证已通过（`.devloop/verify.md`）
+- [ ] 敏感文件已获授权
+- [ ] 重大改动已打标签
+```
+
+## 样例 H：给用户看的提交确认话术
+
+```
+准备提交 12 个文件（+340 / -86）：
+- src/（5 个）：refund.py、order.py、refund 模型…
+- migrations/（1 个）：0031_add_refund_amount.sql ← 高危，已获授权
+- docs/（3 个）：api/refund.md、db/refund_order.md…
+
+建议信息：feat(refund): 支持部分退款
+重大改动：是（涉及迁移 + 426 行）
+建议标签：v1.4.0
+
+清单和提交信息是否 OK？确认后我提交。
+```
+
+---
+
 ## 格式红线
 
 - 每个结论后面跟 `文件:行`

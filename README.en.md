@@ -128,7 +128,7 @@ Judgment work (semantic impact, root cause, fix design) is driven by the playboo
 ## Contributing
 
 ```bash
-python tests/test_devloop.py     # 11 smoke tests, no dependencies
+python tests/test_devloop.py     # 17 smoke tests, no dependencies
 ```
 
 The most valuable contribution is adding checks for your stack to `references/impact-rules.md`.

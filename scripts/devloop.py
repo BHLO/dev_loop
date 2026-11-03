@@ -28,10 +28,11 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -873,6 +874,324 @@ def cmd_graph(args) -> int:
     return 0
 
 
+# ----------------------------------------------------------------------------- verify
+
+SELFTEST_RULES = [
+    (("api", "controller", "route", "handler", "endpoint"), "接口调用",
+     "正常入参 / 缺参 / 越权 / 不存在的 id"),
+    (("migration", "migrate", ".sql"), "数据库迁移",
+     "开发库执行一遍，再回滚一次，确认可重复执行"),
+    (("model", "entity", "dao", "repository", "schema"), "数据读写",
+     "新数据写入后读回；存量数据能否正常解析"),
+    (("job", "task", "scheduler", "cron"), "定时任务",
+     "手动触发一次，观察是否重复执行"),
+    (("mq", "kafka", "rabbit", "consumer", "producer"), "消息收发",
+     "发一条消息，确认消费与失败重试"),
+    (("config", "settings", ".env", "yaml", "yml"), "配置加载",
+     "换环境启动一次，确认缺配置时有兜底"),
+    (("web/", ".vue", ".tsx", ".jsx", "component", "page"), "页面操作",
+     "打开页面走一遍主流程，看空态与错误提示"),
+    (("auth", "security", "permission", "rbac"), "权限校验",
+     "无权限账号访问一次，确认被拦"),
+    (("docs/", ".md", ".rst", "readme", "changelog"), "文档",
+     "渲染后读一遍：目录、链接、示例代码是否正常"),
+]
+
+SENSITIVE_PATTERNS = [
+    ("高危", r"(^|/)(migrations?|alembic/versions)/"),
+    ("高危", r"\.(sql|pem|key|p12|jks)$"),
+    ("高危", r"(^|/)\.env"),
+    ("高危", r"(\.github/workflows/|\.gitlab-ci\.yml|Jenkinsfile|azure-pipelines)"),
+    ("高危", r"(^|/)(auth|security)/|(permission|rbac|acl)"),
+    ("高危", r"(prod|production)[\w.-]*\.(ya?ml|properties|env)$"),
+    ("高危", r"(^|/)(deploy|release|rollback)"),
+    ("高危", r"(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|poetry\.lock|go\.sum|Cargo\.lock)"),
+    ("中危", r"(^|/)(common|utils|core|shared|lib)/"),
+    ("中危", r"(package\.json|pom\.xml|requirements\.txt|pyproject\.toml|go\.mod|Cargo\.toml)$"),
+    ("中危", r"(Dockerfile|docker-compose|(^|/)k8s/|(^|/)helm/)"),
+]
+
+
+def git_status_entries(root: Path) -> list[dict]:
+    """统一的 git status 解析：不受首行前导空格被 strip 的影响。"""
+    rc, out = git(root, "status", "--porcelain", "-uall")
+    if rc != 0:
+        return []
+    entries = []
+    for line in out.splitlines():
+        m = re.match(r"^\s*(\S{1,2})\s+(.+)$", line)
+        if not m:
+            continue
+        code, path = m.group(1), m.group(2).strip()
+        if " -> " in path:
+            path = path.split(" -> ")[-1].strip()
+        if path.startswith(STATE_DIR + "/"):
+            continue
+        entries.append({"status": code, "file": path})
+    return entries
+
+
+def build_selftest_checklist(files: list[str]) -> list[dict]:
+    seen, rows = set(), []
+    for f in files:
+        low = f.lower()
+        hit = None
+        for keys, scene, how in SELFTEST_RULES:
+            if any(k in low for k in keys):
+                hit = (scene, how)
+                break
+        scene, how = hit if hit else ("回归", "从调用该模块的入口跑一遍主流程")
+        if scene in seen:
+            continue
+        seen.add(scene)
+        rows.append({"scene": scene, "how": how, "file": f})
+    return rows[:8]
+
+
+def parse_test_summary(text: str) -> dict:
+    info = {"passed": 0, "failed": 0, "skipped": 0, "failures": []}
+    for pat, key in ((r"(\d+)\s+passed", "passed"), (r"(\d+)\s+failed", "failed"),
+                     (r"(\d+)\s+skipped", "skipped")):
+        m = re.search(pat, text)
+        if m:
+            info[key] = int(m.group(1))
+    for line in text.splitlines():
+        if re.search(r"(FAILED|✕|✗|\bError\b.*Traceback)", line):
+            s = line.strip()
+            if s and s not in info["failures"]:
+                info["failures"].append(s[:160])
+    info["failures"] = info["failures"][:15]
+    return info
+
+
+def cmd_verify(args) -> int:
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+    profile = load_profile(root)
+    cmd = args.cmd or (profile.get("commands") or {}).get("test", "")
+
+    changed = [x.strip() for x in args.files.split(",") if x.strip()] if args.files else []
+    if not changed:
+        changed = [e["file"] for e in git_status_entries(root)]
+    checklist = build_selftest_checklist(changed)
+
+    md = ["# 验证报告", "", f"- 生成时间：{now()}", f"- 项目根：`{root}`",
+          f"- 涉及改动：{len(changed)} 个文件", ""]
+
+    if not cmd:
+        md += ["## 结果", "", "**NOT RUN** —— 没有检测到测试命令。", "",
+               "请在 `--cmd` 里指定，例如 `--cmd \"pytest -q\"`，或补齐项目测试脚本。", ""]
+        (out_dir / "verify.md").write_text("\n".join(md), encoding="utf-8")
+        print("NOT RUN：没有测试命令。用 --cmd 指定后重跑。")
+        return 2
+
+    if args.dry_run:
+        md += ["## 结果", "", f"**DRY RUN** —— 将要执行：`{cmd}`", ""]
+        (out_dir / "verify.md").write_text("\n".join(md), encoding="utf-8")
+        print(f"将要执行：{cmd}")
+        return 0
+
+    started = time.time()
+    try:
+        proc = subprocess.run(cmd, cwd=str(root), shell=True, capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=args.timeout)
+        code = proc.returncode
+        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        note = ""
+    except subprocess.TimeoutExpired:
+        code, output, note = 124, "", f"执行超时（>{args.timeout}s）"
+    except Exception as exc:  # noqa: BLE001
+        code, output, note = 1, "", f"执行失败：{exc}"
+    elapsed = round(time.time() - started, 1)
+
+    ok = code == 0
+    summary = parse_test_summary(output)
+    md += ["## 结果", "",
+           f"- 命令：`{cmd}`",
+           f"- 退出码：{code}" + (f"（{note}）" if note else ""),
+           f"- 耗时：{elapsed}s",
+           f"- 结论：**{'通过' if ok else '未通过'}**", ""]
+    if summary["passed"] or summary["failed"]:
+        md += [f"- 用例：通过 {summary['passed']} / 失败 {summary['failed']} / 跳过 {summary['skipped']}", ""]
+    if summary["failures"]:
+        md += ["### 失败详情", ""] + [f"- `{f}`" for f in summary["failures"]] + [""]
+
+    md += ["## 建议用户自测清单", "",
+           "| ✓ | 场景 | 怎么测 | 涉及文件 |", "|---|---|---|---|"]
+    for row in checklist:
+        md.append(f"| □ | {row['scene']} | {row['how']} | `{row['file']}` |")
+    if not checklist:
+        md.append("| □ | 回归 | 从入口跑一遍主流程 | — |")
+    md.append("")
+
+    tail = [ln for ln in output.splitlines() if ln.strip()][-40:]
+    md += ["## 输出尾部（最后 40 行）", "", "```", *tail, "```", ""]
+
+    (out_dir / "verify.md").write_text("\n".join(md), encoding="utf-8")
+    print(f"验证 -> {out_dir / 'verify.md'}（{'通过' if ok else '未通过'}，退出码 {code}，{elapsed}s）")
+    print(f"  自测清单 {len(checklist)} 项，已写入报告")
+    return 0 if ok else 1
+
+
+# ----------------------------------------------------------------------------- commit
+
+def latest_tag(root: Path) -> str:
+    rc, out = git(root, "describe", "--tags", "--abbrev=0")
+    return out if rc == 0 and out else ""
+
+
+def repo_version(root: Path) -> str:
+    """没有 tag 历史时，退而读 CHANGELOG 顶部版本号。"""
+    p = root / "CHANGELOG.md"
+    if p.exists():
+        m = re.search(r"##\s*\[(\d+\.\d+\.\d+)\]", read_text(p))
+        if m:
+            return m.group(1)
+    return ""
+
+
+def suggest_tag(current: str, bump: str) -> str:
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", current or "v0.0.0")
+    major, minor, patch = (int(x) for x in m.groups()) if m else (0, 0, 0)
+    if bump == "major":
+        major, minor, patch = major + 1, 0, 0
+    elif bump == "minor":
+        minor, patch = minor + 1, 0
+    else:
+        patch += 1
+    return f"v{major}.{minor}.{patch}"
+
+
+def cmd_commit(args) -> int:
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+
+    entries = git_status_entries(root)
+    if not entries:
+        print("工作区干净，没有可提交的改动。")
+        return 2
+
+    _, numstat = git(root, "diff", "HEAD", "--numstat")
+    stat = {}
+    for line in numstat.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            add = int(parts[0]) if parts[0].isdigit() else 0
+            rm = int(parts[1]) if parts[1].isdigit() else 0
+            stat[parts[2]] = (add, rm)
+    for e in entries:                      # 未跟踪文件不在 diff 里，按行数记
+        if e["file"] in stat:
+            continue
+        p = root / e["file"]
+        if p.is_file():
+            try:
+                stat[e["file"]] = (len(read_text(p).splitlines()), 0)
+            except Exception:
+                stat[e["file"]] = (0, 0)
+    total_add = sum(v[0] for v in stat.values())
+    total_rm = sum(v[1] for v in stat.values())
+
+    groups: dict[str, list[dict]] = {}
+    for e in entries:
+        top = e["file"].split("/")[0] if "/" in e["file"] else "(根目录)"
+        groups.setdefault(top, []).append(e)
+
+    sensitive = []
+    for e in entries:
+        for level, pat in SENSITIVE_PATTERNS:
+            if re.search(pat, e["file"], re.IGNORECASE):
+                sensitive.append({"file": e["file"], "level": level})
+                break
+
+    deleted = [e["file"] for e in entries if "D" in e["status"]]
+    major_reasons = []
+    if len(entries) >= 10:
+        major_reasons.append(f"改动 {len(entries)} 个文件（≥10）")
+    if total_add + total_rm >= 300:
+        major_reasons.append(f"增减 {total_add + total_rm} 行（≥300）")
+    if deleted:
+        major_reasons.append(f"删除 {len(deleted)} 个文件")
+    if any(s["level"] == "高危" for s in sensitive):
+        high = sorted({s["file"] for s in sensitive if s["level"] == "高危"})
+        major_reasons.append("涉及高危文件：" + "、".join(high[:4]))
+
+    tag = ""
+    tag_note = ""
+    if args.bump:
+        last = latest_tag(root)
+        if last:
+            tag = suggest_tag(last, args.bump)
+            tag_note = f"基于最近标签 {last}"
+        else:
+            ver = repo_version(root)
+            if ver:
+                tag = f"v{ver}"
+                tag_note = "仓库还没有 tag，按 CHANGELOG 顶部版本起第一个标签"
+            else:
+                tag = suggest_tag("", args.bump)
+                tag_note = "仓库没有版本信息，从 v0.1.0 起"
+
+    md = ["# 提交清单（待确认）", "", f"- 生成时间：{now()}",
+          f"- 文件数：{len(entries)}（+{total_add} / -{total_rm}）",
+          f"- 分支：{(git(root, 'rev-parse', '--abbrev-ref', 'HEAD')[1]) or '?'}",
+          f"- 当前 HEAD：{(git(root, 'rev-parse', '--short', 'HEAD')[1]) or '?'}", ""]
+
+    md += ["## 提交内容", "", "| 状态 | 文件 | 增/删 |", "|---|---|---|"]
+    for group, items in sorted(groups.items()):
+        md.append(f"| | **{group}**（{len(items)}） | |")
+        for e in items:
+            a, r = stat.get(e["file"], (0, 0))
+            md.append(f"| {e['status']} | `{e['file']}` | +{a}/-{r} |")
+    md.append("")
+
+    if sensitive:
+        md += ["## 敏感文件提醒", "", "| 级别 | 文件 |", "|---|---|"]
+        for s in sensitive:
+            md.append(f"| {s['level']} | `{s['file']}` |")
+        md += ["", "高危文件需逐个确认已获授权，见 `references/sensitive-files.md`。", ""]
+    else:
+        md += ["## 敏感文件提醒", "", "无。", ""]
+
+    md += ["## 建议提交信息", "", "```", args.message or "（待填写）", "```", ""]
+
+    md += ["## 是否重大改动", ""]
+    if major_reasons:
+        md += ["**是**：" + "；".join(major_reasons), ""]
+        suggested = args.tag or tag or suggest_tag(latest_tag(root), "minor")
+        md += [f"建议打标签：`{suggested}`" + (f"（{tag_note}）" if tag_note else ""), ""]
+    else:
+        md += ["否。按普通提交处理即可。", ""]
+
+    md += ["## 确认项", "", "- [ ] 文件清单无误，没有遗漏或多带",
+           "- [ ] 提交信息描述准确",
+           "- [ ] 验证已通过（`.devloop/verify.md`）",
+           "- [ ] 敏感文件已获授权",
+           "- [ ] 重大改动已打标签" if major_reasons else "", ""]
+
+    (out_dir / "commit-plan.md").write_text("\n".join(md), encoding="utf-8")
+    print(f"提交清单 -> {out_dir / 'commit-plan.md'}（{len(entries)} 个文件，"
+          f"{'重大改动' if major_reasons else '普通改动'}）")
+    for s in sensitive:
+        print(f"  敏感：{s['level']} {s['file']}")
+
+    if args.apply:
+        if not args.message:
+            print("--apply 需要同时给出 --message，未提交。")
+            return 2
+        git(root, "add", "-A", "--", ".", f":(exclude){STATE_DIR}")
+        rc, out = git(root, "commit", "-m", args.message)
+        if rc != 0:
+            print(f"提交失败：{out}")
+            return 1
+        print(f"已提交：{out.splitlines()[0] if out else ''}")
+        if args.tag:
+            rc, out = git(root, "tag", "-a", args.tag, "-m", args.message)
+            print(f"已打标签 {args.tag}" if rc == 0 else f"打标签失败：{out}")
+    else:
+        print("（仅生成清单，未提交。确认后加 --apply --message \"...\" 执行）")
+    return 0
+
+
 # ----------------------------------------------------------------------------- state
 
 def cmd_state(args) -> int:
@@ -946,6 +1265,23 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--depth", type=int, default=1, help="向下展开层数，1-3，默认 1")
     g.add_argument("--max-nodes", type=int, default=40, help="节点上限，默认 40")
     g.set_defaults(func=cmd_graph)
+
+    v = sub.add_parser("verify", help="跑测试并生成自测清单")
+    v.add_argument("--root", default=".")
+    v.add_argument("--cmd", default="", help="测试命令，省略则用 profile 里检测到的")
+    v.add_argument("--files", default="", help="只针对这些改动文件生成自测清单")
+    v.add_argument("--timeout", type=int, default=900, help="超时秒数，默认 900")
+    v.add_argument("--dry-run", action="store_true", help="只显示将执行的命令")
+    v.set_defaults(func=cmd_verify)
+
+    c = sub.add_parser("commit", help="生成提交清单（默认不提交）")
+    c.add_argument("--root", default=".")
+    c.add_argument("--message", default="", help="建议的提交信息")
+    c.add_argument("--bump", choices=["patch", "minor", "major"], default="",
+                   help="给出标签递增建议")
+    c.add_argument("--apply", action="store_true", help="用户确认后才加：执行 git commit")
+    c.add_argument("--tag", default="", help="提交后要打的标签，如 v1.3.0")
+    c.set_defaults(func=cmd_commit)
 
     st = sub.add_parser("state", help="阶段状态")
     st.add_argument("--root", default=".")

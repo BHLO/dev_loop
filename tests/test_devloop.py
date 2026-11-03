@@ -161,6 +161,77 @@ class Fixture(unittest.TestCase):
         targets = {n["file"] for n in data["nodes"] if n["level"] == 0}
         self.assertEqual(targets, {"src/api/user.py", "src/service/order.py"})
 
+    # --------------------------------------------------------------- verify
+
+    def test_verify_passing_command(self) -> None:
+        (self.root / "pass_test.py").write_text("print('7 passed')\n", encoding="utf-8")
+        proc = run("verify", "--root", str(self.root),
+                   "--cmd", f'"{sys.executable}" pass_test.py')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        md = (self.root / ".devloop" / "verify.md").read_text(encoding="utf-8")
+        self.assertIn("通过", md)
+        self.assertIn("自测清单", md)
+        self.assertIn("通过 7", md)
+
+    def test_verify_failing_command_exits_nonzero(self) -> None:
+        (self.root / "fail_test.py").write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
+        proc = run("verify", "--root", str(self.root),
+                   "--cmd", f'"{sys.executable}" fail_test.py')
+        self.assertEqual(proc.returncode, 1)
+        md = (self.root / ".devloop" / "verify.md").read_text(encoding="utf-8")
+        self.assertIn("未通过", md)
+
+    def test_verify_without_command_marks_not_run(self) -> None:
+        proc = run("verify", "--root", str(self.root))
+        self.assertEqual(proc.returncode, 2)
+        md = (self.root / ".devloop" / "verify.md").read_text(encoding="utf-8")
+        self.assertIn("NOT RUN", md)
+
+    # --------------------------------------------------------------- commit
+
+    def test_commit_plan_does_not_commit(self) -> None:
+        if not self.has_git:
+            self.skipTest("need git")
+        (self.root / "new_file.py").write_text("x = 1\n", encoding="utf-8")
+        head_before = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(self.root),
+            capture_output=True, encoding="utf-8").stdout.strip()
+
+        proc = run("commit", "--root", str(self.root), "--message", "feat: 新增文件")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        md = (self.root / ".devloop" / "commit-plan.md").read_text(encoding="utf-8")
+        self.assertIn("new_file.py", md)
+        self.assertIn("feat: 新增文件", md)
+
+        head_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(self.root),
+            capture_output=True, encoding="utf-8").stdout.strip()
+        self.assertEqual(head_before, head_after, "默认不应提交")
+
+    def test_commit_flags_sensitive_major_change(self) -> None:
+        if not self.has_git:
+            self.skipTest("need git")
+        (self.root / "migrations").mkdir(exist_ok=True)
+        (self.root / "migrations" / "0001_x.sql").write_text("ALTER TABLE t ADD c INT;\n",
+                                                             encoding="utf-8")
+        proc = run("commit", "--root", str(self.root), "--message", "feat: 迁移", "--bump", "minor")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        md = (self.root / ".devloop" / "commit-plan.md").read_text(encoding="utf-8")
+        self.assertIn("高危", md)
+        self.assertIn("重大改动", md)
+        self.assertIn("建议打标签", md)
+
+    def test_commit_apply_creates_commit_and_tag(self) -> None:
+        if not self.has_git:
+            self.skipTest("need git")
+        (self.root / "another.py").write_text("y = 2\n", encoding="utf-8")
+        proc = run("commit", "--root", str(self.root), "--message", "chore: 测试提交",
+                   "--apply", "--tag", "v9.9.9")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        tags = subprocess.run(["git", "tag", "-l"], cwd=str(self.root),
+                              capture_output=True, encoding="utf-8").stdout
+        self.assertIn("v9.9.9", tags)
+
     # --------------------------------------------------------------- drift
 
     def test_drift_finds_stale_path(self) -> None:
