@@ -83,7 +83,7 @@ jdbc:[a-z]+://[^"\s]+                 # 生产连接串
 `scripts/devloop.py` 的敏感判定直接读下面这个块，**这是唯一的事实源**——
 改规则只改这里，不要再去脚本里改数组。表格（§一、§二）是给人看的说明，脚本不读。
 
-修改后跑一次自检：`python tests/test_skill_rules.py`
+修改后用 `python scripts/devloop.py sensitive --root . --files <文件>` 自查一遍
 
 ```yaml
 rules:

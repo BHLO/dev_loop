@@ -33,7 +33,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -1578,10 +1578,20 @@ def cmd_audit(args) -> int:
         if not m:
             continue
         path = m.group(1).replace("\\", "/")
-        entry = planned.setdefault(path, {"items": [], "action": ""})
+        entry = planned.setdefault(path, {"items": [], "action": "", "source": "state"})
         entry["items"].append(text)
         if not entry["action"]:
             entry["action"] = parse_planned_action(text)
+
+    # state 里没录清单，就退回 S1 阶段登记时的那份文件集合——否则所有改动都会被判越界
+    plan_source = "state.open_items" if planned else ""
+    if not planned:
+        s1 = load_gates(root).get("S1") or {}
+        for f in s1.get("files", []):
+            f = f.replace("\\", "/")
+            planned[f] = {"items": [f"S1 登记：{f}"], "action": "", "source": "gate"}
+        if planned:
+            plan_source = "gate S1 的 files（state 里没有明细清单）"
 
     base = args.base
     rc, diff = git(root, "diff", "--name-status", base)
@@ -1623,10 +1633,11 @@ def cmd_audit(args) -> int:
     md = ["# 变更审计对账", "", f"- 生成时间：{now()}",
           f"- 对比基线：{base}",
           f"- 对账范围：{scope_name}",
-          f"- 计划文件：{len(planned)} 个（来自 state.open_items）",
+          f"- 计划文件：{len(planned)} 个（来自 {plan_source or '无'}）",
           f"- 实际变更：{len(changed)} 个文件", ""]
-    if not items:
-        md += ["> state 里没有未闭环项，无法对账。S1 结束后请用 `state --add` 录入清单。", ""]
+    if not planned:
+        md += ["> 没有可对账的计划：state 里没有未闭环项，S1 也没有登记过文件集合。",
+               "> 先跑 `gate --stage S1 --files ...` 或 `state --add \"C1 | 文件 | 动作 | 理由\"`。", ""]
 
     md += ["## 漏改（计划里有、diff 里没有）", ""]
     if missing:
@@ -1685,21 +1696,84 @@ STAGE_TITLE = {
     "S6": "提交",
 }
 
-# 每个阶段交给用户过目的东西，必须有这些内容；缺了不许登记
+# 每个阶段交给用户过目的东西：标题在不算数，得有实质内容。
+# (显示名, 可接受的标题关键词, 规则)
+#   rule: {"min_items": n}      表格数据行 / 列表项至少 n 条
+#         {"must_contain": str} 小节内必须出现该片段
+#         {}                    只要小节非空即可（"无" 也算有效回答）
 REQUIRED_SECTIONS = {
-    "S1": [("技术路线", ("技术路线", "方案选型", "选型对比")),
-           ("实现流程", ("实现流程", "执行步骤", "实施步骤")),
-           ("架构图", ("架构图", "```mermaid")),
-           ("改造清单", ("改造清单",))],
-    "S2": [("漏改判定", ("漏改",)),
-           ("越界判定", ("越界",))],
-    "S3": [("文档判定", ("新建", "更新")),
-           ("文档动作", ("文档",))],
-    "S4": [("问题清单", ("P0", "P1", "问题"))],
-    "S5": [("根因", ("根因",)),
-           ("修复方案", ("修复",))],
-    "S6": [("提交清单", ("提交",))],
+    "S1": [("技术路线", ("技术路线", "方案选型", "选型对比"), {"min_items": 2}),
+           ("实现流程", ("实现流程", "执行步骤", "实施步骤"), {"min_items": 1}),
+           ("架构图", ("架构图",), {"must_contain": "```mermaid"}),
+           ("改造清单", ("改造清单",), {"min_items": 1})],
+    "S2": [("漏改判定", ("漏改",), {}),
+           ("越界判定", ("越界",), {})],
+    "S3": [("文档判定", ("文档", "新建", "更新", "不改"), {"min_items": 1})],
+    "S4": [("问题清单", ("健康", "问题", "P0", "P1"), {})],
+    "S5": [("根因", ("根因",), {}),
+           ("修复方案", ("修复",), {})],
+    "S6": [("提交清单", ("提交",), {})],
 }
+
+HEADING_RE = re.compile(r"^(#{1,6})\s*(.+?)\s*$")
+TABLE_SEP_RE = re.compile(r"^\|[\s:\-|]+\|$")
+
+
+def section_body(text: str, keys: tuple[str, ...]) -> str:
+    """取包含关键词的标题下的正文，到下一个标题为止。"""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = HEADING_RE.match(line.strip())
+        if not m:
+            continue
+        if any(k in m.group(2) for k in keys):
+            body = []
+            for nxt in lines[i + 1:]:
+                if HEADING_RE.match(nxt.strip()):
+                    break
+                body.append(nxt)
+            return "\n".join(body)
+    return ""
+
+
+def count_items(body: str) -> int:
+    """数表格数据行（不含表头与分隔行）与列表项的条数。"""
+    lines = [l.strip() for l in body.splitlines()]
+    n, i = 0, 0
+    while i < len(lines):
+        if lines[i].startswith("|"):
+            block = []
+            while i < len(lines) and lines[i].startswith("|"):
+                block.append(lines[i])
+                i += 1
+            rows = [r for r in block if not TABLE_SEP_RE.match(r)]
+            # 有分隔行才说明是标准表格，首行是表头；没有分隔行就全按数据行算
+            header = 1 if len(rows) < len(block) else 0
+            n += max(0, len(rows) - header)
+            continue
+        if re.match(r"^([-*+]\s+\S|\d+[.)]\s+\S)", lines[i]):
+            n += 1
+        i += 1
+    return n
+
+
+def check_doc_sections(stage: str, text: str) -> list[str]:
+    """返回不合格项的描述；空列表表示通过。"""
+    problems = []
+    for label, keys, rule in REQUIRED_SECTIONS.get(stage, []):
+        body = section_body(text, keys)
+        if not body.strip():
+            problems.append(f"{label}（小节为空或只有标题）")
+            continue
+        if "must_contain" in rule and rule["must_contain"] not in body:
+            problems.append(f"{label}（缺少 {rule['must_contain']} 代码块）")
+            continue
+        need = rule.get("min_items")
+        if need:
+            got = count_items(body)
+            if got < need:
+                problems.append(f"{label}（只有 {got} 条，至少 {need} 条）")
+    return problems
 
 
 def gates_path(root: Path) -> Path:
@@ -1726,15 +1800,6 @@ def gate_sig(files: list[str], doc: Path | None) -> str:
     if doc and doc.exists():
         body += "\n" + doc_sha(doc)
     return hashlib.sha1(body.encode("utf-8")).hexdigest()[:16]
-
-
-def check_doc_sections(stage: str, text: str) -> list[str]:
-    """返回缺失的章节名；空列表表示通过。"""
-    missing = []
-    for label, keys in REQUIRED_SECTIONS.get(stage, []):
-        if not any(k in text for k in keys):
-            missing.append(label)
-    return missing
 
 
 def cmd_gate(args) -> int:
@@ -1839,9 +1904,11 @@ def cmd_gate(args) -> int:
     text = read_text(doc_path, limit=1_000_000)
     missing = check_doc_sections(stage, text)
     if missing:
-        print(f"{stage} 报告缺少必需内容，不予登记：{'、'.join(missing)}")
+        print(f"{stage} 报告不达要求，不予登记：")
+        for item in missing:
+            print(f"  - {item}")
         print(f"  报告：{rel(root, doc_path)}")
-        print("  用户要过目的是完整方案，不是一句\"改这几个文件\"。补齐后再登记。")
+        print(f"  用户要过目的是 {stage} 的完整产出，不是几个空标题。补齐后再登记。")
         return 2
 
     signature = gate_sig(files, doc_path)

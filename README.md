@@ -157,12 +157,8 @@ python scripts/devloop.py state  --root . --show
 
 ## 贡献
 
-```bash
-python tests/test_devloop.py     # 81 项测试（行为 / 深度 / 规则完整性），无第三方依赖
-```
-
 欢迎补充 `references/impact-rules.md` 里你所在技术栈的检查项——这是最容易产生价值的地方。
-提 PR 前请确保测试通过。
+提 PR 前请自己跑一遍 `scan` / `impact` / `gate` 确认脚本仍可用。
 
 ## License
 

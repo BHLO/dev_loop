@@ -1,6 +1,10 @@
 # dev-loop 分析产物（报告 + 阶段状态），不进版本库
 .devloop/
 
+# 测试脚本与 CI：只在本地跑，不入库（仓库只放技能运行需要的文件）
+tests/
+.github/
+
 # Python
 __pycache__/
 *.py[cod]

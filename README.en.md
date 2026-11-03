@@ -127,9 +127,7 @@ Judgment work (semantic impact, root cause, fix design) is driven by the playboo
 
 ## Contributing
 
-```bash
-python tests/test_devloop.py     # 81 tests (behaviour / deep / rule integrity), no dependencies
-```
+Before opening a PR, run `scan` / `impact` / `gate` once to confirm the scripts still work.
 
 The most valuable contribution is adding checks for your stack to `references/impact-rules.md`.
 
