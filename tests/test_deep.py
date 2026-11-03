@@ -53,6 +53,52 @@ def make_repo(files: dict[str, str]) -> Path:
     return root
 
 
+S1_REPORT = """# S1 需求影响面与技术方案
+
+## 一、需求理解与验收标准
+部分退款：可退金额 ≤ 订单金额 - 已退金额。
+
+## 二、技术路线
+| 路线 | 做法 | 代价 | 结论 |
+|---|---|---|---|
+| A 接口层校验 | 改动小 | 多入口不一致 | 备选 |
+| B 收敛到领域模型 | 加字段与迁移 | 口径唯一 | 采纳 |
+
+## 三、实现流程
+1. 迁移 → 2. 模型加校验 → 3. 接口透传 → 4. 状态机 → 5. 对账
+
+## 四、架构图
+```mermaid
+flowchart TB
+  R["/api/refund"] --> O[Order]
+  O --> T[(orders)]
+```
+
+## 五、改造清单
+| 编号 | 文件:行 | 动作 | 改造理由 | 依据 |
+|---|---|---|---|---|
+| C1 | src/api/refund.py:1 | 改 | 入参写死全额 | refund.py:1 |
+"""
+
+CHECKLIST_ONLY = """# S1 影响面
+
+## 改造清单
+| C1 | src/api/refund.py | 改 | 加参数 |
+"""
+
+
+def write_s1_report(root: Path, text: str = S1_REPORT) -> None:
+    d = root / ".devloop"
+    d.mkdir(exist_ok=True)
+    (d / "S1-impact.md").write_text(text, encoding="utf-8")
+
+
+def write_report(root: Path, name: str, text: str) -> None:
+    d = root / ".devloop"
+    d.mkdir(exist_ok=True)
+    (d / name).write_text(text, encoding="utf-8")
+
+
 BASE_FILES = {
     "src/api/refund.py": "def create_refund(order_id):\n    return {'order_id': order_id}\n",
     "src/service/order.py": "from src.api.refund import create_refund\n\ndef refund(o):\n    return create_refund(o)\n",
@@ -327,6 +373,253 @@ class GraphFormats(unittest.TestCase):
         self.assertIn("[待新建]", md)
 
 
+# ============================================================ 阶段闸门
+
+class StageGate(unittest.TestCase):
+    """每个阶段的产出都要用户过目；S1 还必须先有技术方案，不能只给清单。"""
+
+    def setUp(self) -> None:
+        self.root = make_repo({"a.py": "a\n"})
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _gates(self) -> dict:
+        f = self.root / ".devloop" / "gates.json"
+        return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+
+    # ---------------------------------------------------------- 拦截
+
+    def test_cannot_enter_s2_without_record(self) -> None:
+        proc = run("state", "--root", str(self.root), "--set", "S2")
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("还没登记过", proc.stdout)
+
+    def test_checklist_without_plan_is_refused(self) -> None:
+        """S1 只给清单不给方案，不许登记——这是本轮改动的核心。"""
+        write_s1_report(self.root, CHECKLIST_ONLY)
+        proc = run("gate", "--root", str(self.root), "--stage", "S1",
+                   "--files", "a.py", "--doc", ".devloop/S1-impact.md")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("缺少必需内容", proc.stdout)
+        for part in ("技术路线", "实现流程", "架构图"):
+            self.assertIn(part, proc.stdout)
+
+    def test_missing_report_is_refused(self) -> None:
+        proc = run("gate", "--root", str(self.root), "--stage", "S1", "--files", "a.py")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("找不到阶段报告", proc.stdout)
+
+    def test_registered_but_unapproved_blocks_next_stage(self) -> None:
+        write_s1_report(self.root)
+        run("gate", "--root", str(self.root), "--stage", "S1",
+            "--files", "a.py", "--doc", ".devloop/S1-impact.md")
+        proc = run("state", "--root", str(self.root), "--set", "S2")
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("还没给用户确认过", proc.stdout)
+
+    def test_approve_requires_user_quote(self) -> None:
+        write_s1_report(self.root)
+        run("gate", "--root", str(self.root), "--stage", "S1",
+            "--files", "a.py", "--doc", ".devloop/S1-impact.md")
+        proc = run("gate", "--root", str(self.root), "--stage", "S1", "--approve")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("必须带 --note", proc.stdout)
+
+    # ---------------------------------------------------------- 放行
+
+    def test_approve_then_enter_s2(self) -> None:
+        write_s1_report(self.root)
+        run("gate", "--root", str(self.root), "--stage", "S1",
+            "--files", "a.py", "--doc", ".devloop/S1-impact.md", "--summary", "需求")
+        proc = run("gate", "--root", str(self.root), "--stage", "S1",
+                   "--approve", "--note", "可以，按 B 方案来")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+
+        g = self._gates()["S1"]
+        self.assertEqual(g["status"], "approved")
+        self.assertEqual(g["note"], "可以，按 B 方案来")
+        self.assertEqual(g["doc"], ".devloop/S1-impact.md")
+
+        self.assertEqual(run("state", "--root", str(self.root), "--set", "S2").returncode, 0)
+
+    def test_report_change_invalidates_approval(self) -> None:
+        write_s1_report(self.root)
+        run("gate", "--root", str(self.root), "--stage", "S1",
+            "--files", "a.py", "--doc", ".devloop/S1-impact.md")
+        # 用户看的是旧版，agent 偷偷改了报告再确认
+        write_s1_report(self.root, S1_REPORT + "\n## 六、补充\n偷偷加一段\n")
+        proc = run("gate", "--root", str(self.root), "--stage", "S1",
+                   "--approve", "--note", "可以")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("已过期", proc.stdout)
+
+    def test_skip_needs_reason_and_unblocks(self) -> None:
+        """阶段不适用：不用先登记，但必须给理由。"""
+        proc = run("gate", "--root", str(self.root), "--stage", "S3", "--skip")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("必须带 --note", proc.stdout)
+
+        proc = run("gate", "--root", str(self.root), "--stage", "S3",
+                   "--skip", "--note", "本次只改代码，无文档变更")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertEqual(self._gates()["S3"]["status"], "skipped")
+
+    def test_every_stage_is_gated(self) -> None:
+        """不是只有 S1：S2 没确认也进不了 S3。"""
+        write_s1_report(self.root)
+        run("gate", "--root", str(self.root), "--stage", "S1",
+            "--files", "a.py", "--doc", ".devloop/S1-impact.md")
+        run("gate", "--root", str(self.root), "--stage", "S1", "--approve", "--note", "可以")
+        run("state", "--root", str(self.root), "--set", "S2")
+
+        proc = run("state", "--root", str(self.root), "--set", "S3")
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("S2", proc.stdout)
+
+        write_report(self.root, "S2-audit.md", "# S2\n## 漏改\n无\n## 越界\n无\n")
+        run("gate", "--root", str(self.root), "--stage", "S2",
+            "--files", "a.py", "--doc", ".devloop/S2-audit.md")
+        self.assertEqual(run("state", "--root", str(self.root), "--set", "S3").returncode, 3,
+                         "登记但未确认也不能进")
+        run("gate", "--root", str(self.root), "--stage", "S2", "--approve", "--note", "可以")
+        self.assertEqual(run("state", "--root", str(self.root), "--set", "S3").returncode, 0)
+
+    def test_show_lists_all_stages(self) -> None:
+        write_s1_report(self.root)
+        run("gate", "--root", str(self.root), "--stage", "S1",
+            "--files", "a.py", "--doc", ".devloop/S1-impact.md")
+        proc = run("gate", "--root", str(self.root), "--show")
+        self.assertEqual(proc.returncode, 0)
+        for st in ("S1", "S2", "S3", "S4", "S5", "S6"):
+            self.assertIn(st, proc.stdout)
+        self.assertIn("待确认", proc.stdout)
+
+    # ---------------------------------------------------------- 轮次
+
+    def test_new_round_archives_reports_and_clears_gates(self) -> None:
+        write_s1_report(self.root)
+        run("gate", "--root", str(self.root), "--stage", "S1",
+            "--files", "a.py", "--doc", ".devloop/S1-impact.md")
+        run("gate", "--root", str(self.root), "--stage", "S1", "--approve", "--note", "可以")
+        run("state", "--root", str(self.root), "--add", "C1 | a.py | 改 | 旧需求")
+
+        proc = run("state", "--root", str(self.root), "--round", "第二轮需求")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+
+        state = json.loads((self.root / ".devloop" / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["stage"], "S1")
+        self.assertEqual(state["round"], "第二轮需求")
+        self.assertEqual(state["open_items"], [])
+        self.assertEqual(len(state["rounds"]), 1)
+
+        self.assertFalse((self.root / ".devloop" / "gates.json").exists(), "确认记录必须清空")
+        self.assertFalse((self.root / ".devloop" / "S1-impact.md").exists(),
+                         "上一轮报告必须归档，否则新一轮会误用")
+        archived = list((self.root / ".devloop" / "archive").rglob("S1-impact.md"))
+        self.assertEqual(len(archived), 1)
+
+    def test_second_round_needs_fresh_approval(self) -> None:
+        write_s1_report(self.root)
+        run("gate", "--root", str(self.root), "--stage", "S1",
+            "--files", "a.py", "--doc", ".devloop/S1-impact.md")
+        run("gate", "--root", str(self.root), "--stage", "S1", "--approve", "--note", "可以")
+        run("state", "--root", str(self.root), "--set", "S2")
+
+        run("state", "--root", str(self.root), "--round", "第二轮")
+        proc = run("state", "--root", str(self.root), "--set", "S2")
+        self.assertEqual(proc.returncode, 3, "新一轮不能沿用上一轮的批准")
+        self.assertIn("还没登记过", proc.stdout)
+
+
+# ============================================================ 提交闸门
+
+class CommitGate(unittest.TestCase):
+    """提交必须先出清单、用户过目、确认后才能提交推送。"""
+
+    def setUp(self) -> None:
+        self.root = make_repo({"a.py": "a\n"})
+        (self.root / "a.py").write_text("a\nb\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _head(self) -> str:
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(self.root),
+                              capture_output=True, encoding="utf-8").stdout.strip()
+
+    def test_apply_without_plan_is_refused(self) -> None:
+        before = self._head()
+        proc = run("commit", "--root", str(self.root), "--message", "feat: x", "--apply")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("没有找到本轮的提交清单", proc.stdout)
+        self.assertEqual(self._head(), before, "被拒时不许提交")
+
+    def test_message_must_match_plan(self) -> None:
+        run("commit", "--root", str(self.root), "--message", "feat: 清单里的信息")
+        before = self._head()
+        proc = run("commit", "--root", str(self.root), "--message", "feat: 偷改的信息",
+                   "--apply")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("提交信息与用户看过的清单不一致", proc.stdout)
+        self.assertEqual(self._head(), before)
+
+    def test_content_change_after_plan_is_refused(self) -> None:
+        run("commit", "--root", str(self.root), "--message", "feat: 加一行")
+        (self.root / "a.py").write_text("a\nb\nc\n", encoding="utf-8")   # 同名不同内容
+        before = self._head()
+        proc = run("commit", "--root", str(self.root), "--message", "feat: 加一行", "--apply")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("文件内容在清单生成之后又被改过", proc.stdout)
+        self.assertEqual(self._head(), before)
+
+    def test_new_file_after_plan_is_refused(self) -> None:
+        run("commit", "--root", str(self.root), "--message", "feat: 加一行")
+        (self.root / "b.py").write_text("x = 1\n", encoding="utf-8")
+        proc = run("commit", "--root", str(self.root), "--message", "feat: 加一行", "--apply")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("文件集合在清单生成之后变了", proc.stdout)
+
+    def test_push_requires_remote(self) -> None:
+        run("commit", "--root", str(self.root), "--message", "feat: 加一行")
+        before = self._head()
+        proc = run("commit", "--root", str(self.root), "--message", "feat: 加一行",
+                   "--apply", "--push")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("没有配置远程地址", proc.stdout)
+        self.assertEqual(self._head(), before, "无远程时不该留下本地提交")
+
+    def test_confirmed_flow_commits(self) -> None:
+        run("commit", "--root", str(self.root), "--message", "feat: 加一行")
+        before = self._head()
+        proc = run("commit", "--root", str(self.root), "--message", "feat: 加一行", "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertNotEqual(self._head(), before)
+
+    def test_tag_follows_changelog_when_ahead(self) -> None:
+        """CHANGELOG 已经写了更高版本时，标签应当就是那一版，而不是 tag+1。"""
+        (self.root / "CHANGELOG.md").write_text(
+            "## [1.9.0] - 2026-11-03\n\n- 未发布内容\n", encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "cl")
+        git(self.root, "-c", "user.email=t@t", "-c", "user.name=t",
+            "tag", "-a", "v1.5.0", "-m", "old")
+        (self.root / "a.py").write_text("a\nb\nc\n", encoding="utf-8")   # 相对已提交版本要有变化
+
+        run("commit", "--root", str(self.root), "--message", "feat: 下一版", "--bump", "minor")
+        data = json.loads((self.root / ".devloop" / "commit-plan.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["suggested_tag"], "v1.9.0",
+                         "CHANGELOG 已写到 1.9.0，不该再按 tag+1 得出 v1.6.0")
+
+    def test_plan_file_carries_fingerprint(self) -> None:
+        run("commit", "--root", str(self.root), "--message", "feat: 加一行")
+        md = (self.root / ".devloop" / "commit-plan.md").read_text(encoding="utf-8")
+        self.assertIn("清单指纹", md)
+        data = json.loads((self.root / ".devloop" / "commit-plan.json").read_text(encoding="utf-8"))
+        for key in ("token", "message", "files", "head", "worktree"):
+            self.assertIn(key, data)
+
+
 # ============================================================ 端到端闭环
 
 class EndToEnd(unittest.TestCase):
@@ -358,6 +651,19 @@ class EndToEnd(unittest.TestCase):
         run("state", "--root", r, "--set", "S1")
         for item in plan:
             run("state", "--root", r, "--add", item)
+        # 阶段门 S1：先写技术方案，登记，用户同意后才放行
+        self.assertEqual(run("state", "--root", r, "--set", "S2").returncode, 3,
+                         "没登记不该能进 S2")
+        write_s1_report(self.root)
+        listed = ("src/api/refund.py,src/service/order.py,"
+                  "migrations/0001_refund_amount.sql,docs/api/refund.md")
+        proc = run("gate", "--root", r, "--stage", "S1", "--files", listed,
+                   "--doc", ".devloop/S1-impact.md", "--summary", "订单支持部分退款")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertEqual(run("state", "--root", r, "--set", "S2").returncode, 3,
+                         "登记了但没确认，也不能进")
+        run("gate", "--root", r, "--stage", "S1", "--approve", "--note", "可以，按 B 方案来")
+        self.assertEqual(run("state", "--root", r, "--set", "S2").returncode, 0)
 
         # 实施：只改代码，文档留到 S3
         (self.root / "src" / "api" / "refund.py").write_text(
@@ -377,6 +683,16 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("漏改", code_md)
         self.assertNotIn("docs/api/refund.md", code_md.split("## 越界")[0])
 
+        # 阶段门 S2：对账单给用户过目
+        self.assertEqual(run("state", "--root", r, "--set", "S3").returncode, 3,
+                         "S2 没确认不该能进 S3")
+        proc = run("gate", "--root", r, "--stage", "S2",
+                   "--files", "src/api/refund.py,src/service/order.py",
+                   "--doc", ".devloop/audit-code.md")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        run("gate", "--root", r, "--stage", "S2", "--approve", "--note", "审计没问题，继续")
+        self.assertEqual(run("state", "--root", r, "--set", "S3").returncode, 0)
+
         # 验证门禁
         proc = run("verify", "--root", r, "--cmd", f'"{sys.executable}" -c "print(1)"')
         self.assertEqual(proc.returncode, 0)
@@ -393,6 +709,16 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         proc = run("baseline", "--root", r, "--check")
         self.assertEqual(proc.returncode, 0)
+
+        # 阶段门 S3：文档清单给用户过目
+        write_report(self.root, "S3-docs.md",
+                     "# S3 文档同步\n\n| 文档 | 判定 |\n|---|---|\n"
+                     "| docs/api/refund.md | 更新：补 amount 参数 |\n")
+        proc = run("gate", "--root", r, "--stage", "S3",
+                   "--files", "docs/api/refund.md", "--doc", ".devloop/S3-docs.md")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        run("gate", "--root", r, "--stage", "S3", "--approve", "--note", "文档可以")
+        self.assertEqual(run("state", "--root", r, "--set", "S4").returncode, 0)
 
         # 提交门禁：只出清单，不落库
         head_before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=r,
@@ -411,7 +737,12 @@ class EndToEnd(unittest.TestCase):
         produced = {p.name for p in (self.root / ".devloop").iterdir()}
         expected = {"profile.json", "impact.md", "graph.md", "graph.mmd", "sensitive.md",
                     "state.json", "audit-code.md", "verify.md", "audit-docs.md",
-                    "doc-baseline.json", "baseline-check.md", "commit-plan.md"}
+                    "doc-baseline.json", "baseline-check.md", "commit-plan.md",
+                    "gates.json", "S1-gate.md", "S2-gate.md", "S3-gate.md"}
+        gates = json.loads((self.root / ".devloop" / "gates.json").read_text(encoding="utf-8"))
+        for st in ("S1", "S2", "S3"):
+            self.assertEqual(gates[st]["status"], "approved", f"{st} 应已确认")
+            self.assertTrue(gates[st]["note"], f"{st} 应记录用户原话")
         missing = expected - produced
         self.assertFalse(missing, f"缺少产物：{missing}")
 

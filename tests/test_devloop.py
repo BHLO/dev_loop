@@ -225,9 +225,10 @@ class Fixture(unittest.TestCase):
         if not self.has_git:
             self.skipTest("need git")
         (self.root / "another.py").write_text("y = 2\n", encoding="utf-8")
+        run("commit", "--root", str(self.root), "--message", "chore: 测试提交")  # 先出清单
         proc = run("commit", "--root", str(self.root), "--message", "chore: 测试提交",
                    "--apply", "--tag", "v9.9.9")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         tags = subprocess.run(["git", "tag", "-l"], cwd=str(self.root),
                               capture_output=True, encoding="utf-8").stdout
         self.assertIn("v9.9.9", tags)
@@ -323,12 +324,12 @@ class Fixture(unittest.TestCase):
     # --------------------------------------------------------------- state
 
     def test_state_roundtrip(self) -> None:
-        run("state", "--root", str(self.root), "--set", "S2", "--note", "改完")
+        run("state", "--root", str(self.root), "--set", "S1", "--note", "出清单")
         run("state", "--root", str(self.root), "--add", "补测试")
         proc = run("state", "--root", str(self.root), "--show")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         state = json.loads(proc.stdout)
-        self.assertEqual(state["stage"], "S2")
+        self.assertEqual(state["stage"], "S1")
         self.assertEqual(len(state["open_items"]), 1)
         self.assertFalse(state["open_items"][0]["done"])
 

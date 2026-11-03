@@ -33,7 +33,7 @@ class SkillRules(unittest.TestCase):
 
     def test_required_sections_exist(self) -> None:
         required = [
-            "五、S1 需求影响面",
+            "五、S1 需求影响面与技术方案",
             "六、S2 变更审计",
             "七、S3 文档同步",
             "八、S4 健康检查",
@@ -41,7 +41,7 @@ class SkillRules(unittest.TestCase):
             "十、敏感文件确认协议",
             "十一、偏离清单",
             "十二、验证门禁",
-            "十三、提交确认与打标签",
+            "十三、提交确认与推送",
             "十四、闭环回退规则",
             "十五、产物目录",
             "十六、脚本参考",
@@ -54,7 +54,7 @@ class SkillRules(unittest.TestCase):
     def test_iron_rules_count(self) -> None:
         body = section(self.text, "二、铁律")
         rules = re.findall(r"^\d+\. \*\*", body, re.M)
-        self.assertGreaterEqual(len(rules), 12, "铁律少于 12 条，可能被删")
+        self.assertGreaterEqual(len(rules), 14, "铁律少于 14 条，可能被删")
 
     def test_anti_patterns_exist(self) -> None:
         body = section(self.text, "十七、反模式")
@@ -74,8 +74,20 @@ class SkillRules(unittest.TestCase):
             "验证门禁": "改完必测",
             "环境问题区分": "环境问题",
             "自测清单": "自测清单",
-            "提交确认": "清单先给用户看",
+            "提交确认": "先给用户过目",
+            "确认后才提交": "贴给用户",
+            "提交即推送": "--apply --push",
+            "清单指纹": "清单指纹",
             "动作核对": "动作不符",
+            "技术方案": "先出技术方案，再出清单",
+            "技术路线": "技术路线（至少两个候选）",
+            "实现流程": "实现流程（可执行步骤）",
+            "架构图": "架构图（Mermaid，至少一张）",
+            "验收标准": "验收标准（可判定）",
+            "阶段确认门": "阶段确认门",
+            "每阶段都要停": "每个阶段之间都要停",
+            "阶段跳过要理由": "--skip --note",
+            "轮次重置": "state --round",
             "文档基线": "baseline --root",
             "唯一事实源": "判定规则只有一份",
             "重大改动": "重大改动",
@@ -85,10 +97,25 @@ class SkillRules(unittest.TestCase):
             with self.subTest(rule=name):
                 self.assertIn(needle, self.text, f"缺少关键规矩：{name}")
 
+    def test_s1_has_tech_plan_before_checklist(self) -> None:
+        """S1 必须先给方案再给清单，且方案四件套齐全。"""
+        body = section(self.text, "五、S1 需求影响面与技术方案")
+        for part in ("技术路线", "实现流程", "架构图", "验收标准"):
+            with self.subTest(part=part):
+                self.assertIn(part, body, f"S1 缺 {part}")
+        self.assertLess(body.index("技术路线"), body.index("改造清单"),
+                        "方案必须排在清单前面")
+
+    def test_every_stage_has_gate(self) -> None:
+        """五个阶段都要有收尾确认门，不能只有 S1。"""
+        for stage in ("S1", "S2", "S3", "S4", "S5"):
+            with self.subTest(stage=stage):
+                self.assertIn(f"--stage {stage}", self.text, f"{stage} 没有确认门")
+
     def test_every_subcommand_documented(self) -> None:
         body = section(self.text, "十六、脚本参考")
         for cmd in ("scan", "impact", "graph", "drift", "sensitive", "audit",
-                    "baseline", "verify", "commit"):
+                    "baseline", "verify", "commit", "gate"):
             with self.subTest(cmd=cmd):
                 self.assertIn(f"`{cmd} ", body + self.text, f"脚本表缺 {cmd}")
 

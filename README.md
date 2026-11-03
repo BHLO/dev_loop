@@ -158,7 +158,7 @@ python scripts/devloop.py state  --root . --show
 ## 贡献
 
 ```bash
-python tests/test_devloop.py     # 57 项测试（行为 / 深度 / 规则完整性），无第三方依赖
+python tests/test_devloop.py     # 79 项测试（行为 / 深度 / 规则完整性），无第三方依赖
 ```
 
 欢迎补充 `references/impact-rules.md` 里你所在技术栈的检查项——这是最容易产生价值的地方。

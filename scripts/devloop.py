@@ -33,7 +33,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.5.0"
+VERSION = "1.8.0"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -1214,9 +1214,39 @@ def repo_version(root: Path) -> str:
     return ""
 
 
-def suggest_tag(current: str, bump: str) -> str:
-    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", current or "v0.0.0")
-    major, minor, patch = (int(x) for x in m.groups()) if m else (0, 0, 0)
+def worktree_signature(root: Path, entries: list[dict]) -> str:
+    """把"当前工作区的实际内容"压成一个指纹。
+
+    只比文件名不够——清单给人看过之后又改了同一行代码，文件名没变，
+    但用户看到的已经不是现在要提交的东西了。
+    """
+    parts = []
+    _, diff = git(root, "diff", "HEAD")
+    parts.append(diff)
+    for e in entries:
+        p = root / e["file"]
+        if p.is_file():
+            parts.append(f"{e['file']}:{doc_sha(p)}")
+    return hashlib.sha1("\n".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def parse_ver(text: str) -> tuple[int, int, int]:
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+
+def suggest_tag(current: str, bump: str, root: Path | None = None) -> str:
+    """建议标签。
+
+    优先看 CHANGELOG 顶部版本：如果它已经超过最近 tag，说明本次内容就是那一版，
+    直接用它——按 tag 递增会得出一个和 CHANGELOG 对不上的号。
+    """
+    tag_ver = parse_ver(current) if current else (0, 0, 0)
+    cl_ver = parse_ver(repo_version(root)) if root else (0, 0, 0)
+    if cl_ver > tag_ver:
+        return "v%d.%d.%d" % cl_ver
+
+    major, minor, patch = tag_ver
     if bump == "major":
         major, minor, patch = major + 1, 0, 0
     elif bump == "minor":
@@ -1278,17 +1308,17 @@ def cmd_commit(args) -> int:
     tag_note = ""
     if args.bump:
         last = latest_tag(root)
-        if last:
-            tag = suggest_tag(last, args.bump)
+        ver = repo_version(root)
+        if ver and parse_ver(ver) > parse_ver(last):
+            # CHANGELOG 已经写了更高的版本，说明本次内容就是那一版
+            tag = f"v{ver}"
+            tag_note = f"按 CHANGELOG 顶部版本（高于最近标签 {last or '无'}）"
+        elif last:
+            tag = suggest_tag(last, args.bump, root)
             tag_note = f"基于最近标签 {last}"
         else:
-            ver = repo_version(root)
-            if ver:
-                tag = f"v{ver}"
-                tag_note = "仓库还没有 tag，按 CHANGELOG 顶部版本起第一个标签"
-            else:
-                tag = suggest_tag("", args.bump)
-                tag_note = "仓库没有版本信息，从 v0.1.0 起"
+            tag = suggest_tag("", args.bump, root)
+            tag_note = "仓库没有版本信息，从 v0.1.0 起"
 
     md = ["# 提交清单（待确认）", "", f"- 生成时间：{now()}",
           f"- 文件数：{len(entries)}（+{total_add} / -{total_rm}）",
@@ -1327,27 +1357,107 @@ def cmd_commit(args) -> int:
            "- [ ] 敏感文件已获授权",
            "- [ ] 重大改动已打标签" if major_reasons else "", ""]
 
-    (out_dir / "commit-plan.md").write_text("\n".join(md), encoding="utf-8")
-    print(f"提交清单 -> {out_dir / 'commit-plan.md'}（{len(entries)} 个文件，"
-          f"{'重大改动' if major_reasons else '普通改动'}）")
+    # 只有"生成清单"这一趟才写文件；--apply 那一趟必须读到上一趟留下的清单，
+    # 否则等于自己给自己开路条。
+    if not args.apply:
+        token = hashlib.sha1(
+            ("|".join(sorted(e["file"] for e in entries)) + "\n" + (args.message or "")
+             + "\n" + (git(root, "rev-parse", "HEAD")[1] or "")
+             + "\n" + worktree_signature(root, entries)).encode("utf-8")
+        ).hexdigest()[:16]
+        md += ["## 清单指纹", "",
+               f"`{token}`", "",
+               "用户看过这份清单之后，如果文件集合、提交信息或 HEAD 有任何变化，"
+               "指纹就对不上，提交会被拒绝——需要重新生成清单再看一次。", ""]
+        (out_dir / "commit-plan.md").write_text("\n".join(md), encoding="utf-8")
+        write_json(out_dir / "commit-plan.json", {
+            "generated_at": now(), "token": token, "message": args.message or "",
+            "files": sorted(e["file"] for e in entries), "major": bool(major_reasons),
+            "suggested_tag": tag, "head": git(root, "rev-parse", "HEAD")[1] or "",
+            "worktree": worktree_signature(root, entries),
+        })
+    if not args.apply:
+        print(f"提交清单 -> {out_dir / 'commit-plan.md'}（{len(entries)} 个文件，"
+              f"{'重大改动' if major_reasons else '普通改动'}）")
     for s in sensitive:
         print(f"  敏感：{s['level']} {s['file']}")
 
-    if args.apply:
-        if not args.message:
-            print("--apply 需要同时给出 --message，未提交。")
+    if not args.apply:
+        print("（仅生成清单，未提交。把清单和提交信息给用户过目，")
+        print("  用户明确同意后再加 --apply --push --message \"...\" 执行）")
+        return 0
+
+    # ---- 提交前的三道校验，任何一道不过都不许提交 ----
+    if not args.message:
+        print("--apply 需要同时给出 --message（必须是用户确认过的那份），未提交。")
+        return 2
+
+    plan_json = out_dir / "commit-plan.json"
+    if not plan_json.exists():
+        print("没有找到本轮的提交清单。先跑一次不带 --apply 的 commit，把清单给用户过目。")
+        return 2
+    saved = json.loads(plan_json.read_text(encoding="utf-8"))
+    expect = hashlib.sha1(
+        ("|".join(saved.get("files", [])) + "\n" + args.message + "\n"
+         + (git(root, "rev-parse", "HEAD")[1] or "")
+         + "\n" + worktree_signature(root, entries)).encode("utf-8")
+    ).hexdigest()[:16]
+    if expect != saved.get("token"):
+        cur_head = git(root, "rev-parse", "HEAD")[1] or ""
+        cur_files = sorted(e["file"] for e in entries)
+        cur_wt = worktree_signature(root, entries)
+        if saved.get("message") != args.message:
+            why = "提交信息与用户看过的清单不一致"
+            detail = [f"清单里：{saved.get('message', '')}", f"你给的：{args.message}"]
+        elif saved.get("files") != cur_files:
+            added = sorted(set(cur_files) - set(saved.get("files", [])))
+            gone = sorted(set(saved.get("files", [])) - set(cur_files))
+            why = "文件集合在清单生成之后变了"
+            detail = [f"新增：{added or '无'}", f"消失：{gone or '无'}"]
+        elif saved.get("head") != cur_head:
+            why = "HEAD 在清单生成之后变了（有人提交过）"
+            detail = [f"清单时：{saved.get('head')}", f"现在：{cur_head}"]
+        else:
+            why = "文件内容在清单生成之后又被改过（文件名没变，但内容变了）"
+            detail = ["用户看到的那版已经不是现在要提交的了"]
+        print(f"{why}，拒绝提交。")
+        for line in detail:
+            print("  " + line)
+        print("  重新跑一次不带 --apply 的 commit，把新清单给用户看过再提交。")
+        return 2
+
+    if args.push:
+        rc, remotes = git(root, "remote")
+        if rc != 0 or not remotes.strip():
+            print("要求了 --push，但仓库没有配置远程地址，未提交也未推送。")
+            print("  先设置远程：git remote add origin <url>")
             return 2
-        git(root, "add", "-A", "--", ".", f":(exclude){STATE_DIR}")
-        rc, out = git(root, "commit", "-m", args.message)
+
+    git(root, "add", "-A", "--", ".", f":(exclude){STATE_DIR}")
+    rc, out = git(root, "commit", "-m", args.message)
+    if rc != 0:
+        print(f"提交失败：{out}")
+        return 1
+    print(f"已提交：{out.splitlines()[0] if out else ''}")
+
+    if args.tag:
+        rc, out = git(root, "tag", "-a", args.tag, "-m", args.message)
+        print(f"已打标签 {args.tag}" if rc == 0 else f"打标签失败：{out}")
+
+    if args.push:
+        rc, out = git(root, "push")
+        if rc != 0 and "no upstream" in (out or "").lower():
+            rc, out = git(root, "push", "-u", "origin", "HEAD")
         if rc != 0:
-            print(f"提交失败：{out}")
+            print(f"推送失败：{out}")
+            print("  提交已在本地，修好远程后再 git push。")
             return 1
-        print(f"已提交：{out.splitlines()[0] if out else ''}")
+        print("已推送。")
         if args.tag:
-            rc, out = git(root, "tag", "-a", args.tag, "-m", args.message)
-            print(f"已打标签 {args.tag}" if rc == 0 else f"打标签失败：{out}")
+            rc, out = git(root, "push", "origin", args.tag)
+            print(f"已推送标签 {args.tag}" if rc == 0 else f"推送标签失败：{out}")
     else:
-        print("（仅生成清单，未提交。确认后加 --apply --message \"...\" 执行）")
+        print("未推送（加 --push 才会推）。")
     return 0
 
 
@@ -1538,6 +1648,217 @@ def cmd_audit(args) -> int:
     return 1 if (missing or mismatched) else 0
 
 
+# ----------------------------------------------------------------------------- gate
+
+# 进入某阶段之前，上一阶段必须已被用户确认（或显式声明不适用）
+GATE_ORDER = ["S1", "S2", "S3", "S4", "S5", "S6"]
+PREV_STAGE = {GATE_ORDER[i]: GATE_ORDER[i - 1] for i in range(1, len(GATE_ORDER))}
+
+DEFAULT_DOC = {
+    "S1": "S1-impact.md", "S2": "S2-audit.md", "S3": "S3-docs.md",
+    "S4": "S4-health.md", "S5": "S5-fix.md", "S6": "commit-plan.md",
+}
+
+STAGE_TITLE = {
+    "S1": "需求影响面与技术方案",
+    "S2": "变更审计",
+    "S3": "文档同步",
+    "S4": "健康检查",
+    "S5": "缺陷定位与修复",
+    "S6": "提交",
+}
+
+# 每个阶段交给用户过目的东西，必须有这些内容；缺了不许登记
+REQUIRED_SECTIONS = {
+    "S1": [("技术路线", ("技术路线", "方案选型", "选型对比")),
+           ("实现流程", ("实现流程", "执行步骤", "实施步骤")),
+           ("架构图", ("架构图", "```mermaid")),
+           ("改造清单", ("改造清单",))],
+    "S2": [("漏改判定", ("漏改",)),
+           ("越界判定", ("越界",))],
+    "S3": [("文档判定", ("新建", "更新")),
+           ("文档动作", ("文档",))],
+    "S4": [("问题清单", ("P0", "P1", "问题"))],
+    "S5": [("根因", ("根因",)),
+           ("修复方案", ("修复",))],
+    "S6": [("提交清单", ("提交",))],
+}
+
+
+def gates_path(root: Path) -> Path:
+    return ensure_state_dir(root) / "gates.json"
+
+
+def load_gates(root: Path) -> dict:
+    p = gates_path(root)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def gate_sig(files: list[str], doc: Path | None) -> str:
+    """指纹只覆盖两样：清单文件集合 + 阶段报告内容。
+
+    不覆盖整个工作区——S2 之后代码本来就在改，覆盖 worktree 会让每次批准都失效。
+    报告被改过 = 用户看到的已经不是这份了。
+    """
+    body = "|".join(sorted(files))
+    if doc and doc.exists():
+        body += "\n" + doc_sha(doc)
+    return hashlib.sha1(body.encode("utf-8")).hexdigest()[:16]
+
+
+def check_doc_sections(stage: str, text: str) -> list[str]:
+    """返回缺失的章节名；空列表表示通过。"""
+    missing = []
+    for label, keys in REQUIRED_SECTIONS.get(stage, []):
+        if not any(k in text for k in keys):
+            missing.append(label)
+    return missing
+
+
+def cmd_gate(args) -> int:
+    """阶段确认门：每个阶段产出清单 → 用户过目 → 批准 → 才能进下一阶段。"""
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+    gates = load_gates(root)
+
+    stage = (getattr(args, "stage", None) or "S1").upper()
+    if stage not in GATE_ORDER:
+        print(f"未知阶段 {stage}，可选：{'、'.join(GATE_ORDER)}")
+        return 2
+
+    do_skip = bool(getattr(args, "skip", False))
+    if args.show or (not args.approve and not do_skip and not args.files):
+        if not gates:
+            print("还没有任何阶段被登记或确认。")
+            return 0
+        md = ["# 阶段确认状态", "", "| 阶段 | 内容 | 状态 | 时间 | 用户原话 |", "|---|---|---|---|---|"]
+        names = {"pending": "**待确认**", "approved": "已确认", "skipped": "不适用"}
+        for st in GATE_ORDER:
+            g = gates.get(st)
+            if not g:
+                md.append(f"| {st} | {STAGE_TITLE[st]} | 未登记 | — | — |")
+                continue
+            md.append(f"| {st} | {STAGE_TITLE[st]} | {names.get(g.get('status'), '?')} | "
+                      f"{g.get('at', '')} | {g.get('note', '') or '—'} |")
+        md += ["", "> 待确认的阶段，agent 必须停下等用户点头；不许自行推进。", ""]
+        (out_dir / "gates.md").write_text("\n".join(md), encoding="utf-8")
+        print("\n".join(md))
+        return 0
+
+    # ---------------- 批准 / 跳过
+    if do_skip and not args.approve and stage not in gates:
+        # 阶段不适用时本来就没有清单文件，允许直接标记，但必须说明理由
+        if not args.note.strip():
+            print(f"--skip 必须带 --note：写清为什么这个阶段不适用，"
+                  f"例如 \"本次只改代码，无文档变更\"。")
+            return 2
+        gates[stage] = {"at": now(), "status": "skipped", "summary": args.summary or "",
+                        "files": [], "doc": "", "signature": "", "note": args.note.strip()}
+        write_json(gates_path(root), gates)
+        nxt = GATE_ORDER[GATE_ORDER.index(stage) + 1] if stage != GATE_ORDER[-1] else None
+        print(f"{stage}（{STAGE_TITLE[stage]}）标记为不适用"
+              + (f"——可以进入 {nxt}。" if nxt else "——流程结束。"))
+        print(f"  用户原话：{args.note.strip()}")
+        return 0
+
+    if args.approve or do_skip:
+        g = gates.get(stage)
+        if not g:
+            print(f"{stage} 还没有登记过，没有可确认的清单。")
+            print(f"  先登记：gate --stage {stage} --files a.py,b.py --doc <报告>")
+            return 2
+        if g.get("status") == "approved":
+            print(f"{stage} 已经确认过（{g.get('at')}），无需重复确认。")
+            return 0
+        if not args.note.strip():
+            print(f"{'--approve' if args.approve else '--skip'} 必须带 --note：写用户的原话，"
+                  f"例如 \"可以，按这个来\" 或 \"这次不涉及文档\"。")
+            return 2
+
+        doc = root / g["doc"] if g.get("doc") else None
+        now_sig = gate_sig(g.get("files", []), doc)
+        if now_sig != g.get("signature"):
+            print(f"{stage} 已过期：清单登记之后报告或文件集合又变了，"
+                  f"用户看到的那份已经不是现在这份。")
+            print("  重新登记 → 再给用户看一次 → 再确认。")
+            return 2
+
+        g["status"] = "approved" if args.approve else "skipped"
+        g["at"] = now()
+        g["note"] = args.note.strip()
+        gates[stage] = g
+        write_json(gates_path(root), gates)
+
+        nxt = GATE_ORDER[GATE_ORDER.index(stage) + 1] if stage != GATE_ORDER[-1] else None
+        if args.approve:
+            print(f"{stage}（{STAGE_TITLE[stage]}）已确认"
+                  + (f"——可以进入 {nxt}。" if nxt else "——流程结束。"))
+        else:
+            print(f"{stage}（{STAGE_TITLE[stage]}）已标记为不适用"
+                  + (f"——可以进入 {nxt}。" if nxt else "。"))
+        print(f"  用户原话：{args.note.strip()}")
+        return 0
+
+    # ---------------- 登记待确认
+    files = [x.strip() for x in args.files.split(",") if x.strip()]
+    if not files:
+        print("--files 必填：这个阶段的清单覆盖哪些文件，逗号分隔。")
+        return 2
+
+    doc_path = Path(args.doc) if args.doc else (out_dir / DEFAULT_DOC[stage])
+    if not doc_path.is_absolute():
+        doc_path = root / doc_path
+    if not doc_path.exists():
+        print(f"找不到阶段报告：{doc_path}")
+        print(f"  {stage} 的报告默认是 {DEFAULT_DOC[stage]}，先写报告再登记；")
+        print("  报告在别处就用 --doc 指定。没有报告就没有可给用户过目的东西。")
+        return 2
+
+    text = read_text(doc_path, limit=1_000_000)
+    missing = check_doc_sections(stage, text)
+    if missing:
+        print(f"{stage} 报告缺少必需内容，不予登记：{'、'.join(missing)}")
+        print(f"  报告：{rel(root, doc_path)}")
+        print("  用户要过目的是完整方案，不是一句\"改这几个文件\"。补齐后再登记。")
+        return 2
+
+    signature = gate_sig(files, doc_path)
+    gates[stage] = {
+        "at": now(), "status": "pending", "summary": args.summary or "",
+        "files": sorted(files), "doc": rel(root, doc_path), "signature": signature,
+        "note": "",
+    }
+    write_json(gates_path(root), gates)
+
+    md = [f"# {stage} · {STAGE_TITLE[stage]}（待用户确认）", "",
+          f"- 登记时间：{gates[stage]['at']}",
+          f"- 说明：{gates[stage]['summary'] or '（未填）'}",
+          f"- 报告：`{gates[stage]['doc']}`",
+          f"- 文件数：{len(files)}",
+          f"- 指纹：`{signature}`", "",
+          "## 清单覆盖的文件", "", "| 文件 |", "|---|"]
+    for f in sorted(files):
+        md.append(f"| `{f}` |")
+    md += ["", "## 确认流程", "",
+           f"1. 把 `{gates[stage]['doc']}` 全文贴给用户（不是只贴文件名）",
+           "2. **停下来等**，不许继续做下一阶段",
+           f"3. 用户明确同意后：`gate --stage {stage} --approve --note \"用户原话\"`",
+           "4. 这个阶段不适用时：`gate --stage " + stage + " --skip --note \"为什么不需要\"`",
+           f"5. 然后才能 `state --set {GATE_ORDER[min(GATE_ORDER.index(stage) + 1, 5)]}`", ""]
+    (out_dir / f"{stage}-gate.md").write_text("\n".join(md), encoding="utf-8")
+
+    print(f"{stage} 已登记待确认 -> {out_dir / f'{stage}-gate.md'}（{len(files)} 个文件）")
+    if stage == "S1":
+        print("  贴之前自查：技术路线是否 ≥2 条、有没有写淘汰理由、架构图是否只画了本次改动相关部分。")
+    print(f"  下一步：把 {gates[stage]['doc']} 贴给用户，等他明确同意后再 gate --stage {stage} --approve --note ...")
+    return 0
+
+
 # ----------------------------------------------------------------------------- baseline
 
 def doc_anchors(text: str) -> list[str]:
@@ -1640,6 +1961,53 @@ def cmd_state(args) -> int:
     state.setdefault("open_items", [])
     state.setdefault("created_at", now())
 
+    if args.set in PREV_STAGE:
+        prev = PREV_STAGE[args.set]
+        g = load_gates(root).get(prev)
+        if not g:
+            print(f"不能进入 {args.set}：{prev}（{STAGE_TITLE[prev]}）还没登记过。")
+            print(f"  1) 先把 {prev} 的产出写成报告")
+            print(f"  2) 登记：gate --stage {prev} --files a.py,b.py --doc <报告>")
+            print(f"  3) 把报告贴给用户看，等他明确同意")
+            print(f"  4) 用户同意后：gate --stage {prev} --approve --note \"用户原话\"")
+            return 3
+        if g.get("status") == "pending":
+            print(f"不能进入 {args.set}：{prev}（{STAGE_TITLE[prev]}）的清单还没给用户确认过。")
+            print(f"  清单在 {rel(root, root / g['doc'])}，先贴给用户，等他点头。")
+            print(f"  用户不认同的处理：改清单 → 重新登记 → 再看一次。")
+            return 3
+        if g.get("status") not in ("approved", "skipped"):
+            print(f"不能进入 {args.set}：{prev} 的状态异常（{g.get('status')}）。")
+            return 3
+
+    if args.round:
+        archived = state.get("open_items", [])
+        state.setdefault("rounds", []).append(
+            {"at": now(), "name": args.round, "items": archived})
+        state["rounds"] = state["rounds"][-20:]
+        state["open_items"] = []
+        state["round"] = args.round
+        state["stage"] = "S1"
+        state["history"].append({"at": now(), "stage": "S1", "note": f"新一轮：{args.round}"})
+        # 上一轮的报告不能留在原地——新一轮登记时会被误当成这一轮的产出
+        out_dir = ensure_state_dir(root)
+        arch_dir = out_dir / "archive" / f"round-{len(state['rounds']):02d}"
+        moved = 0
+        for name in list(DEFAULT_DOC.values()) + [
+                "commit-plan.json", "verify.md", "gates.md", "sensitive.md",
+                "audit-code.md", "audit-docs.md", "graph.md", "impact.md",
+                "drift.md", "doc-baseline.json", "baseline-check.md"]:
+            f = out_dir / name
+            if f.exists():
+                arch_dir.mkdir(parents=True, exist_ok=True)
+                f.replace(arch_dir / name)
+                moved += 1
+        for stale in [gates_path(root)] + [out_dir / f"{st}-gate.md" for st in GATE_ORDER]:
+            if stale.exists():
+                stale.unlink()
+        extra = f"，归档上一轮产物 {moved} 个到 archive/round-{len(state['rounds']):02d}" if moved else ""
+        print(f"新一轮「{args.round}」：已归档上一轮清单（{len(archived)} 项）{extra}，阶段重置为 S1。")
+
     if args.set:
         state["stage"] = args.set
         state["history"].append({"at": now(), "stage": args.set, "note": args.note or ""})
@@ -1654,10 +2022,14 @@ def cmd_state(args) -> int:
     state["updated_at"] = now()
     write_json(path, state)
 
-    if args.show or not (args.set or args.add or args.close is not None or args.note):
+    if args.show or not (args.set or args.add or args.close is not None
+                         or args.note or args.round):
+        gates = load_gates(root)
         print(json.dumps({
             "stage": state["stage"],
+            "round": state.get("round", ""),
             "note": state.get("note", ""),
+            "gates": {k: v.get("status") for k, v in gates.items()},
             "open_items": [i for i in state["open_items"] if not i["done"]],
             "history": state["history"][-6:],
         }, ensure_ascii=False, indent=2))
@@ -1733,12 +2105,35 @@ def build_parser() -> argparse.ArgumentParser:
                    help="给出标签递增建议")
     c.add_argument("--apply", action="store_true", help="用户确认后才加：执行 git commit")
     c.add_argument("--tag", default="", help="提交后要打的标签，如 v1.3.0")
+    c.add_argument("--push", action="store_true",
+                   help="提交后推送到远程；需与 --apply 一起，且用户已确认")
     c.set_defaults(func=cmd_commit)
+
+    g = sub.add_parser("gate", help="阶段确认门：登记 / 用户确认 / 标记不适用")
+    g.add_argument("--root", default=".")
+    g.add_argument("--stage", default="S1", help="阶段 S1-S6，默认 S1")
+    g.add_argument("--files", default="", help="本阶段清单覆盖的文件，逗号分隔")
+    g.add_argument("--doc", default="", help="本阶段报告文件，默认 .devloop/<阶段>-gate.md")
+    g.add_argument("--summary", default="", help="一句话说明")
+    g.add_argument("--approve", action="store_true", help="用户确认后标记为已确认")
+    g.add_argument("--skip", action="store_true", help="本阶段不适用（也要给原话）")
+    g.add_argument("--note", default="", help="用户原话，确认或跳过时必填")
+    g.add_argument("--show", action="store_true", help="查看各阶段确认状态")
+    g.set_defaults(func=cmd_gate)
+
+    pl = sub.add_parser("plan", help="兼容别名：等同 gate --stage S1")
+    pl.add_argument("--root", default=".")
+    pl.add_argument("--files", default="")
+    pl.add_argument("--summary", default="")
+    pl.add_argument("--approve", action="store_true")
+    pl.add_argument("--note", default="")
+    pl.set_defaults(func=cmd_gate, stage="S1")
 
     st = sub.add_parser("state", help="阶段状态")
     st.add_argument("--root", default=".")
     st.add_argument("--set", default="", help="设置当前阶段，如 S1/S2/S3/S4/S5")
     st.add_argument("--note", default="")
+    st.add_argument("--round", default="", help="开新一轮需求：归档旧清单、重置到 S1")
     st.add_argument("--add", default="", help="新增未闭环项")
     st.add_argument("--close", type=int, default=None, help="关闭第 N 个未闭环项")
     st.add_argument("--show", action="store_true")
