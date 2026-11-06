@@ -82,11 +82,10 @@ Talk naturally:
 Or call the CLI directly:
 
 ```bash
-python scripts/devloop.py scan   --root .
-python scripts/devloop.py impact --root . --base HEAD~1
-python scripts/devloop.py graph  --root . --files src/api/user.py,src/service/order.py
-python scripts/devloop.py drift  --root . --changed src/api/user.py
-python scripts/devloop.py state  --root . --show
+python scripts/devloop.py next   --root .                        # what to do next
+python scripts/devloop.py stage  --root . --stage S2 --base HEAD  # one command per stage
+python scripts/devloop.py gate   --root . --stage S2 --approve --note "ok"
+python scripts/devloop.py report --root . --history               # past report versions
 ```
 
 ## Output
@@ -119,9 +118,14 @@ Judgment work (semantic impact, root cause, fix design) is driven by the playboo
 
 ## Known limitations
 
-- **Regex, not AST.** Generated code and unusual styles may be missed. Walk the call chain manually for critical changes.
-- **Dynamic references are invisible**: reflection, DI containers, string-built calls, config-driven routes.
-- **Single repository only.** Cross-service impact needs manual input.
+- **Python uses AST; other languages use regex.** Python symbols, routes and dynamic calls are exact;
+  JS/TS/Java/Go stay approximate.
+- **Dynamic calls can't be resolved — but they are listed.** `blind` reports reflection, DI containers,
+  dynamic imports, `**kwargs` forwarding and string-built routes as explicit blind spots.
+- **Cross-service impact is still manual.** The tool sees one repository; list inter-service calls
+  in the S1 blind-spot section yourself.
+- **`quality` catches obvious defects only** (secrets, SQL concatenation, swallowed exceptions,
+  debug leftovers, missing tests). Passing it does not mean the code is good.
 - **The risk score is a heuristic** for prioritisation, not a verdict on quality.
 - **It won't edit your code.** S1–S4 are read-only.
 

@@ -92,13 +92,14 @@ unzip dev-loop.zip -d ~/.workbuddy/skills/
 也可以直接调脚本：
 
 ```bash
-python scripts/devloop.py scan   --root .
-python scripts/devloop.py impact --root . --base HEAD~1
-python scripts/devloop.py impact --root . --files src/api/user.py   # 无 git 也能用
-python scripts/devloop.py graph  --root . --files src/api/user.py,src/service/order.py
-python scripts/devloop.py drift  --root . --changed src/api/user.py
-python scripts/devloop.py state  --root . --show
+python scripts/devloop.py next   --root .                          # 下一步做什么
+python scripts/devloop.py stage  --root . --stage S2 --base HEAD    # 一条命令跑完 S2
+python scripts/devloop.py gate   --root . --stage S2 --approve --note "可以"
+python scripts/devloop.py report --root . --history                 # 历史报告
 ```
+
+`stage` 内部会调 `impact` / `audit` / `quality` / `blind`；这些底层命令也能单跑，
+例如 `impact --files a.py` 查影响面、`quality --base HEAD` 查实现质量。
 
 ## 产出长什么样
 
@@ -109,9 +110,12 @@ python scripts/devloop.py state  --root . --show
 ├── profile.json      项目画像（语言/构建命令/文档清单/入口点）
 ├── state.json        当前阶段、历史、未闭环项（支持中断续做）
 ├── impact.md/json    变更影响面（调用方/测试/文档/风险分）
+├── blind-spots.md    静态分析盲区（反射/DI/动态路由/跨服务）
+├── quality.md        实现质量：本次新增行的 P0/P1/P2
 ├── drift.md/json     文档漂移（失效的路径、符号、接口）
-├── S1-impact.md      需求影响面 + 改造清单 + 回归范围
-├── S2-audit.md       漏改/越界/调用方判定/待补测试
+├── report.html       报告看板（单文件 HTML，给 present_files 用）
+├── S1-impact.md      技术方案 + 盲区 + 实现约束 + 改造清单
+├── S2-audit.md       漏改/越界/动作不符/实现质量
 ├── S3-docs.md        文档逐段判定与补丁
 ├── S4-health.md      分级问题清单
 └── S5-fix.md         现象→根因→修复→验证
@@ -149,9 +153,13 @@ python scripts/devloop.py state  --root . --show
 
 诚实说明，避免误用：
 
-- **符号提取基于正则，不是 AST**。跨语言、生成代码、极端写法可能漏掉，重要改动仍建议人工过一遍调用链。
-- **识别不到动态引用**：反射、DI 容器、字符串拼装的调用、配置驱动的路由，脚本看不见。
-- **只分析单仓库**。跨服务的影响面需要人工补充。
+- **Python 走 AST，其余语言走正则**。Python 的符号、路由、动态调用是准确解析出来的；
+  JS/TS/Java/Go 等仍是正则近似，生成代码和极端写法可能漏。
+- **动态调用识别不了，但会明确列出来**。`blind` 把反射、DI 容器、动态导入、`**kwargs` 转发、
+  字符串拼装的路由逐条列成「盲区」，告诉你哪些地方影响面清单不成立。不假装准确，但也不瞒你。
+- **跨服务的影响面仍需人工补**。脚本只能看到当前仓库；服务间调用要在 S1 的盲区一节里手写。
+- **`quality` 只抓一眼能判定的硬伤**（密钥、SQL 拼接、吞异常、调试残留、缺测试），
+  命名、抽象、边界条件、并发仍然要人看。它通过 ≠ 代码写得好。
 - **风险分是启发式**，用于排序注意力，不是质量结论。
 - **不会自动改代码**。S1–S4 只读，改动需要你明确要求。
 

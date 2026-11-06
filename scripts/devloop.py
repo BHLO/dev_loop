@@ -34,7 +34,17 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.9.3"
+# 同目录的辅助模块：以脚本方式运行时 sys.path[0] 就是这里，
+# 被当模块导入时要自己补一次。
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+import astindex  # noqa: E402  符号索引与盲区检测
+import quality as quality_mod  # noqa: E402  实现质量扫描
+import report as report_mod  # noqa: E402  Markdown → HTML 报告
+
+VERSION = "1.10.0"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -79,14 +89,6 @@ STOPWORDS = {
     "result", "response", "request", "args", "kwargs", "user", "name", "type", "id",
 }
 
-DEF_RE = re.compile(
-    r"^[ \t]*(?:export[ \t]+)?(?:default[ \t]+)?(?:declare[ \t]+)?"
-    r"(?:(?:public|private|protected|internal|static|final|abstract|async|suspend|override|"
-    r"open|sealed|partial|data)[ \t]+)*"
-    r"(?:def|class|func|function|fn|interface|type|struct|enum|const|let|var|module|impl|"
-    r"trait|record|object)[ \t]+([A-Za-z_$][\w$]{2,})",
-    re.MULTILINE,
-)
 ROUTE_RE = re.compile(r"""["'](/[A-Za-z0-9_\-./{}<>:$]{3,})["']""")
 IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{3,})\b")
 # 最少 1 字符：否则单字符行内代码会让整行的反引号配对整体错位
@@ -413,8 +415,8 @@ def extract_symbols(root: Path, item: dict, body: str) -> tuple[list[str], dict]
         elif line.startswith("-") and not line.startswith("---"):
             meta["removed"] += 1
 
-    for m in DEF_RE.finditer(text):
-        syms.append(m.group(1))
+    # 符号表只有一份，放在 astindex，按语言分派（Java/TS/Go 各有各的写法）
+    syms.extend(astindex.symbol_names(text, Path(item["path"]).suffix))
     for m in ROUTE_RE.finditer(body):
         syms.append(m.group(1))
 
@@ -571,12 +573,31 @@ def cmd_impact(args) -> int:
             if not entries:
                 md.append("- 无")
         md.append("")
+    # 静态分析的盲区：脚本看不见的调用，必须在这里讲清楚，不能让人误以为清单是完整的
+    spots = astindex.blind_in_files(root, [r["file"] for r in results])
+    if spots:
+        by_cat: dict[str, list[dict]] = {}
+        for s in spots:
+            by_cat.setdefault(s["category"], []).append(s)
+        md += ["## 静态分析看不见的部分", "",
+               "以下位置是动态调用/反射/DI/拼装路由，**上面的调用方清单在这里不成立**，"
+               "必须人工确认：", "",
+               "| 类别 | 位置 | 说明 |", "|---|---|---|"]
+        for cat in sorted(by_cat):
+            for s in by_cat[cat][:6]:
+                md.append(f"| {cat} | `{s['file']}:{s['line']}` | {s['why']} |")
+            if len(by_cat[cat]) > 6:
+                md.append(f"| {cat} | 另有 {len(by_cat[cat]) - 6} 处 | 见 `blind-spots.md` |")
+        md += ["", "> 跨服务的调用、配置驱动的行为，静态分析一律看不见，只能人工补。", ""]
+
     (out_dir / "impact.md").write_text("\n".join(md), encoding="utf-8")
 
     print(f"影响面 -> {out_dir / 'impact.md'}（风险 {level}，{len(results)} 个文件）")
     for r in results:
         print(f"  [{r['risk']:>3}] {r['file']}  调用方 {len(r['refs']['code'])} / "
               f"测试 {len(r['refs']['tests'])} / 文档 {len(r['refs']['docs'])}")
+    if spots:
+        print(f"  另有 {len(spots)} 处动态调用看不见，已列进报告，需人工确认")
     return 0
 
 
@@ -714,11 +735,25 @@ def cmd_drift(args) -> int:
 # ----------------------------------------------------------------------------- graph
 
 def collect_defs(root: Path, rel_path: str) -> list[str]:
-    """取出一个文件对外可见的符号：顶层定义 + 模块名。"""
+    """取出一个文件对外可见的符号：顶层定义 + 模块名。
+
+    Python 走 ast（准确、能拿到真实定义），其余语言退回正则。
+    """
     text = read_text(root / rel_path, limit=400_000)
     syms: list[str] = []
-    for m in DEF_RE.finditer(text):
-        syms.append(m.group(1))
+
+    suffix = Path(rel_path).suffix.lower()
+    if suffix in astindex.PY_EXTS:
+        info = astindex.index_file(root / rel_path)
+        if info.get("engine") == "ast":
+            # 用短名：调用方代码里出现的是 get_user，不是 UserService.get_user
+            syms = [d["short"] for d in info.get("defs", [])]
+        else:
+            # 语法错误等情况退回正则，不让分析中断
+            syms = astindex.symbol_names(text, suffix)
+    else:
+        syms = astindex.symbol_names(text, suffix)
+
     stem = Path(rel_path).stem
     if len(stem) >= 4:
         syms.append(stem)
@@ -1706,9 +1741,13 @@ REQUIRED_SECTIONS = {
     "S1": [("技术路线", ("技术路线", "方案选型", "选型对比"), {"min_items": 2}),
            ("实现流程", ("实现流程", "执行步骤", "实施步骤"), {"min_items": 1}),
            ("架构图", ("架构图",), {"must_contain": "```mermaid"}),
-           ("改造清单", ("改造清单",), {"min_items": 1})],
+           ("改造清单", ("改造清单",), {"min_items": 1}),
+           # 动态调用那一类静态查不到，必须在方案里交代怎么兜
+           ("静态盲区", ("盲区", "静态分析"), {}),
+           ("实现约束", ("实现约束", "编码约束", "质量要求"), {})],
     "S2": [("漏改判定", ("漏改",), {}),
-           ("越界判定", ("越界",), {})],
+           ("越界判定", ("越界",), {}),
+           ("实现质量", ("实现质量", "质量",), {})],
     "S3": [("文档判定", ("文档", "新建", "更新", "不改"), {"min_items": 1})],
     "S4": [("问题清单", ("健康", "问题", "P0", "P1"), {})],
     "S5": [("根因", ("根因",), {}),
@@ -2025,6 +2064,14 @@ def cmd_gate(args) -> int:
 
     tag = f"第 {rev} 版" + (f"，改动 {len([d for d in diff_lines if d.startswith(('+', '-'))])} 行" if diff_lines else "")
     print(f"{stage} 已登记待确认 -> {out_dir / f'{stage}-gate.md'}（{len(files)} 个文件，{tag}）")
+
+    # 登记即出页面：少一条命令，也保证「贴给用户的东西」一定存在
+    try:
+        rep = report_mod.write_report(root, VERSION)
+        print(f"  报告页面（第 {rep['seq']} 版）：{rep['path']}")
+        print("  用 present_files 打开它——用户看页面，不看 Markdown 源码。")
+    except OSError as exc:
+        print(f"  报告页面生成失败（{exc}），稍后手动跑 report")
     if revisions:
         print(f"  已记录你提过的 {len(revisions)} 条意见，报告里逐条对应。")
     if stage == "S1":
@@ -2357,6 +2404,382 @@ def cmd_state(args) -> int:
     return 0
 
 
+# ----------------------------------------------------------------------------- blind
+
+def changed_files_now(root: Path, base: str) -> list[str]:
+    """当前改动涉及的代码文件：diff + 未跟踪。"""
+    out: list[str] = []
+    rc, diff = git(root, "diff", "--name-only", base)
+    if rc == 0 and diff:
+        out += [x.strip() for x in diff.splitlines() if x.strip()]
+    out += [e["file"] for e in git_status_entries(root)]
+    return list(dict.fromkeys(out))
+
+
+def cmd_blind(args) -> int:
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+
+    files = [x.strip() for x in args.files.split(",") if x.strip()] if args.files else []
+    if not files:
+        files = [f for f in changed_files_now(root, args.base)
+                 if Path(f).suffix.lower() in CODE_EXTS]
+    if not files:
+        print("没有可检查的代码文件。用 --files 指定，或先产生改动。")
+        return 0
+
+    spots = astindex.blind_in_files(root, files)
+    by_cat: dict[str, list[dict]] = {}
+    for s in spots:
+        by_cat.setdefault(s["category"], []).append(s)
+
+    md = ["# 静态分析盲区", "",
+          f"- 生成时间：{now()}",
+          f"- 检查文件：{len(files)} 个",
+          f"- 盲区：{len(spots)} 处" + (f"，涉及 {len(by_cat)} 类" if by_cat else ""), ""]
+    if not spots:
+        md += ["这些文件里没有发现动态调用、反射、DI、拼装路由等写法。",
+               "",
+               "> 只代表「没有命中已知模式」。跨服务的调用、配置驱动的行为，静态分析一律看不见。", ""]
+    else:
+        md += ["> 以下位置**静态分析看不见调用关系**，必须人工确认，别把脚本结果当完整影响面。", ""]
+        for cat in sorted(by_cat):
+            items = by_cat[cat]
+            md += [f"## {cat}（{len(items)} 处）", "",
+                   f"为什么看不见：{items[0]['why']}", "",
+                   "| 位置 | 代码 | 要确认什么 |", "|---|---|---|"]
+            for s in items:
+                code = s["code"].replace("|", "\\|")[:110]
+                md.append(f"| `{s['file']}:{s['line']}` | `{code}` | {s['action']} |")
+            md.append("")
+
+    (out_dir / "blind-spots.md").write_text("\n".join(md), encoding="utf-8")
+    write_json(out_dir / "blind-spots.json", {"files": files, "count": len(spots),
+                                              "by_category": {k: len(v) for k, v in by_cat.items()},
+                                              "spots": spots})
+
+    print(f"盲区 -> {out_dir / 'blind-spots.md'}（{len(spots)} 处，{len(by_cat)} 类）")
+    for cat in sorted(by_cat):
+        print(f"  {cat} {len(by_cat[cat])} 处")
+    if spots:
+        print("  这些位置脚本看不见，必须人工确认后再写进改造清单。")
+    return 0
+
+
+# ----------------------------------------------------------------------------- quality
+
+def cmd_quality(args) -> int:
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+
+    files = [x.strip() for x in args.files.split(",") if x.strip()] if args.files else []
+    if not files:
+        files = changed_files_now(root, args.base)
+
+    result = quality_mod.run_quality_scan(root, args.base, files)
+    if "error" in result:
+        print(f"质量扫描失败：{result['error']}")
+        return 2
+
+    md = quality_mod.render_markdown(result, args.base, now())
+    (out_dir / "quality.md").write_text(md, encoding="utf-8")
+    write_json(out_dir / "quality.json", {**result["stats"], "hits": result["hits"]})
+
+    stats = result["stats"]
+    print(f"实现质量 -> {out_dir / 'quality.md'}"
+          f"（P0 {stats['P0']} / P1 {stats['P1']} / P2 {stats['P2']}，"
+          f"{stats['files']} 个文件 +{stats['added_lines']} 行）")
+    for h in result["hits"][:8]:
+        loc = f"{h['file']}:{h['line']}" if h["line"] else h["file"]
+        print(f"  {h['severity']} {h['category']:<8} {loc}")
+    if len(result["hits"]) > 8:
+        print(f"  …… 另有 {len(result['hits']) - 8} 处，见报告")
+    if stats["P0"]:
+        print("  P0 必须改完才能继续；P1/P2 可在 S2 报告里写明豁免理由。")
+    return quality_mod.exit_code(stats)
+
+
+# ----------------------------------------------------------------------------- report
+
+def cmd_report(args) -> int:
+    root = Path(args.root).resolve()
+    ensure_state_dir(root)
+
+    if args.history:
+        items = report_mod.list_history(root)
+        if not items:
+            print("还没有历史报告。跑一次 report 就会留下快照。")
+            return 0
+        print(f"最近 {len(items)} 份历史报告（目录 .devloop/{report_mod.HISTORY_DIR}/）：")
+        for it in items:
+            print(f"  {it['time']}  {it['size'] / 1024:6.1f} KB  {it['name']}")
+        print("\n  用 present_files 打开任意一份即可对比当时的内容。")
+        return 0
+
+    res = report_mod.write_report(root, VERSION, args.name)
+    print(f"报告 -> {res['path']}（{res['count']} 份报告，第 {res['seq']} 版）")
+    print(f"  历史 -> {res['snapshot']}（保留最近 {report_mod.KEEP_HISTORY} 份"
+          + (f"，已清理 {res['pruned']} 份旧版" if res["pruned"] else "") + "）")
+    print("  下一步：用 present_files 把这个 html 打开给用户看——")
+    print("  用户要在页面里看阶段状态和报告，不是看一堆 Markdown 源码。")
+    return 0
+
+
+# ----------------------------------------------------------------------------- stage
+
+def _section_of(text: str, *keys: str) -> str:
+    """取某个标题下的正文（到下一个同级或更高级标题为止）。"""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(#{1,6})\s*(.+)$", line.strip())
+        if not m or not any(k in m.group(2) for k in keys):
+            continue
+        level = len(m.group(1))
+        body = []
+        for nxt in lines[i + 1:]:
+            m2 = re.match(r"^(#{1,6})\s", nxt.strip())
+            if m2 and len(m2.group(1)) <= level:
+                break
+            body.append(nxt)
+        return "\n".join(body).strip()
+    return ""
+
+
+def _demote_md(text: str, levels: int = 1) -> str:
+    """把内联进来的 Markdown 标题整体降级，避免拼完后层级被压平。"""
+    out, fence = [], False
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            fence = not fence
+        if not fence and re.match(r"^#{1,5}\s", line):
+            line = "#" * levels + line
+        out.append(line)
+    return "\n".join(out)
+
+
+def _compose_s2(root: Path, out_dir: Path, base: str) -> tuple[str, list[str]]:
+    """把 audit / quality / blind 三份结果拼成 S2 的审计报告。"""
+    audit_md = read_text(out_dir / "audit-code.md")
+    quality_md = read_text(out_dir / "quality.md")
+    blind_md = read_text(out_dir / "blind-spots.md")
+
+    parts = ["# S2 变更审计", "", f"- 生成时间：{now()}", f"- 对比基线：{base}", ""]
+    for title, key in (("漏改", "漏改"), ("越界", "越界"),
+                       ("动作不符", "动作不符"), ("一致", "一致")):
+        body = _section_of(audit_md, key) or "无"
+        parts += [f"## {title}", "", _demote_md(body), ""]
+
+    q_body = _section_of(quality_md, "实现质量") or quality_md.strip()
+    parts += ["## 实现质量", "", _demote_md(q_body) or "无", ""]
+
+    b_body = _section_of(blind_md, "静态分析盲区")
+    if not b_body:
+        b_body = "\n".join(l for l in blind_md.splitlines() if not l.startswith("# ")).strip()
+    parts += ["## 静态盲区", "", _demote_md(b_body) or "无", ""]
+
+    return "\n".join(parts), []
+
+
+def _register_gate(root: Path, stage: str, files: list[str], doc: Path,
+                   summary: str) -> int:
+    """复用 gate 的登记逻辑，避免两套实现。"""
+    ns = argparse.Namespace(root=str(root), stage=stage, files=",".join(files),
+                            doc=str(doc), summary=summary, approve=False, skip=False,
+                            note="", show=False, revise=False)
+    return cmd_gate(ns)
+
+
+def cmd_stage(args) -> int:
+    """一条命令跑完某阶段的机械部分：分析 → 拼报告 → 登记确认门。"""
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+    stage = args.stage.upper()
+    base = args.base
+
+    if args.files:
+        files = [x.strip() for x in args.files.split(",") if x.strip()]
+    else:
+        files = changed_files_now(root, base)
+
+    print(f"[{stage}] 开始：{len(files)} 个文件，基线 {base}")
+
+    if stage == "S2":
+        # 对账
+        rc_audit = cmd_audit(argparse.Namespace(root=str(root), base=base, scope="code"))
+        # 实现质量
+        cmd_quality(argparse.Namespace(root=str(root), base=base, files=",".join(files)))
+        # 盲区
+        cmd_blind(argparse.Namespace(root=str(root), base=base, files=",".join(files)))
+
+        composed, _ = _compose_s2(root, out_dir, base)
+        doc = out_dir / "S2-audit.md"
+        doc.write_text(composed, encoding="utf-8")
+        print(f"审计报告 -> {doc}")
+
+        code_files = [f for f in files if Path(f).suffix.lower() in CODE_EXTS]
+        rc = _register_gate(root, "S2", code_files or files, doc,
+                            args.summary or f"S2 {len(files)} 个文件")
+        # gate 登记时已经生成过页面，这里不再重复
+        print(f"\n下一步：present_files 打开 {out_dir / 'report.html'} 给用户看，"
+              f"等他确认后 gate --stage S2 --approve --note \"<原话>\"")
+        return 0 if rc == 0 else rc
+    if stage == "S1":
+        # 机器能做的部分：影响面、依赖图、盲区、敏感预检
+        cmd_impact(argparse.Namespace(root=str(root), base=base, files=",".join(files),
+                                      staged=False))
+        rc_graph = cmd_graph(argparse.Namespace(root=str(root), files=",".join(files),
+                                                depth=2, max_nodes=40, format="both"))
+        if rc_graph != 0:
+            print("  依赖图没生成（清单里可能没有仓库内文件），S1 方案里的分层要手工补")
+        cmd_blind(argparse.Namespace(root=str(root), base=base, files=",".join(files)))
+        cmd_sensitive(argparse.Namespace(root=str(root), files=",".join(files)))
+
+        manifest = read_text(out_dir / "impact.md")
+        graph_md = read_text(out_dir / "graph.md")
+        blind_md = read_text(out_dir / "blind-spots.md")
+        draft = out_dir / "S1-draft.md"
+        draft.write_text(
+            "# S1 素材（脚本产出，待补方案）\n\n"
+            f"- 生成时间：{now()}\n- 锚点文件：{len(files)} 个\n\n"
+            "> 下面只是**素材**。技术路线、实现流程、架构图、改造清单必须由你写，"
+            "`gate` 会拒绝只有素材的报告。\n\n"
+            "## 影响面\n\n" + (manifest or "（空）") + "\n\n"
+            "## 依赖图\n\n" + (graph_md or "（空）") + "\n\n"
+            "## 静态盲区\n\n" + (blind_md or "（空）") + "\n",
+            encoding="utf-8")
+        report_mod.write_report(root, VERSION)
+        print(f"\n素材 -> {draft}")
+        print("还需要你写：技术路线（≥2 条）、实现流程、架构图（mermaid）、改造清单（含理由）")
+        print(f"写完存成 {out_dir / 'S1-impact.md'}，再 gate --stage S1 --files ... --doc ...")
+        return 0
+
+    if stage == "S3":
+        cmd_drift(argparse.Namespace(root=str(root), docs="", changed=",".join(files)))
+        cmd_audit(argparse.Namespace(root=str(root), base=base, scope="docs"))
+        drift_md = read_text(out_dir / "drift.md")
+        doc = out_dir / "S3-docs.md"
+        doc.write_text(
+            "# S3 文档同步（脚本初稿）\n\n"
+            f"- 生成时间：{now()}\n\n"
+            "## 文档现状\n\n" + (drift_md or "（无漂移检测结果）") + "\n\n"
+            "## 逐文档判定\n\n"
+            "| 文档 | 新建/更新/不改 | 依据 |\n|---|---|---|\n"
+            "| （待填） | | |\n",
+            encoding="utf-8")
+        report_mod.write_report(root, VERSION)
+        print(f"\n初稿 -> {doc}")
+        print("把「逐文档判定」表填完（每行必须给依据），再 gate --stage S3 ...")
+        return 0
+
+    if stage == "S4":
+        # 健康检查的机器部分：客观指标 + 本次改动质量 + 盲区
+        cmd_quality(argparse.Namespace(root=str(root), base=base, files=",".join(files)))
+        cmd_blind(argparse.Namespace(root=str(root), base=base, files=",".join(files)))
+        metrics_out = ""
+        mpath = _HERE / "metrics.py"
+        if mpath.exists():
+            mproc = subprocess.run([sys.executable, str(mpath), "--root", str(root)],
+                                   capture_output=True, encoding="utf-8",
+                                   errors="replace", cwd=str(root))
+            metrics_out = (mproc.stdout or "").strip()
+        doc = out_dir / "S4-health.md"
+        doc.write_text(
+            "# S4 健康检查（脚本初稿）\n\n"
+            f"- 生成时间：{now()}\n- 范围：{'本次改动 ' + str(len(files)) + ' 个文件' if files else '全仓'}\n\n"
+            "## 健康指标\n\n" + (_demote_md(metrics_out) or "（metrics.py 没跑起来）") + "\n\n"
+            "## 问题\n\n"
+            "| 等级 | 文件:行 | 问题 | 影响 | 修复建议 |\n|---|---|---|---|---|\n"
+            "| （待填） | | | | |\n\n"
+            "## P0\n\n（把会导致故障或数据错误的挑出来）\n\n"
+            "## P1\n\n（其余值得修的）\n",
+            encoding="utf-8")
+        rep = report_mod.write_report(root, VERSION)
+        print(f"\n初稿 -> {doc}")
+        print("把「问题」表按 P0/P1/P2 填完（每条要带文件:行与修复建议），再 gate --stage S4 ...")
+        print(f"报告页面：{rep['path']}")
+        return 0
+
+    if stage == "S5":
+        trace = ""
+        if getattr(args, "log", ""):
+            spath = _HERE / "stackmap.py"
+            if spath.exists():
+                log_path = Path(args.log)
+                if not log_path.is_absolute():
+                    log_path = root / log_path
+                subprocess.run([sys.executable, str(spath), "--root", str(root),
+                                "--log", str(log_path)], capture_output=True,
+                               encoding="utf-8", errors="replace", cwd=str(root))
+                trace = read_text(out_dir / "trace.md").strip()
+        doc = out_dir / "S5-fix.md"
+        doc.write_text(
+            "# S5 缺陷定位与修复（脚本初稿）\n\n"
+            f"- 生成时间：{now()}\n\n"
+            "## 现象\n\n（报错原文、堆栈、时间、环境、触发操作、频率）\n\n"
+            "## 栈帧映射\n\n" + (_demote_md(trace) or "（用 --log err.log 让脚本自动映射到文件:行）") + "\n\n"
+            "## 根因\n\n（数据 / 逻辑 / 并发 / 环境 / 依赖，附证据链）\n\n"
+            "## 修复\n\n（最小改动 + 影响半径 + 回归项）\n",
+            encoding="utf-8")
+        rep = report_mod.write_report(root, VERSION)
+        print(f"\n初稿 -> {doc}")
+        print("补完现象、根因、证据链、最小修复，再 gate --stage S5 ...")
+        print(f"报告页面：{rep['path']}")
+        return 0
+
+    print(f"{stage} 没有可自动化的分析；按 SKILL.md 手工做，完成后 gate --stage {stage} ...")
+    return 0
+
+
+# ----------------------------------------------------------------------------- next
+
+def cmd_next(args) -> int:
+    """读状态，直接说下一步做什么，省得每次翻文档。"""
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+    state = json.loads(read_text(out_dir / "state.json") or "{}")
+    gates = load_gates(root)
+    seq = ["S1", "S2", "S3", "S4", "S5", "S6"]
+
+    stage = state.get("stage", "S1")
+    if stage not in seq:
+        stage = "S1"
+
+    print(f"当前阶段：{stage}  轮次：{state.get('round') or '—'}")
+    for st in seq:
+        g = gates.get(st) or {}
+        mark = {"approved": "✓", "pending": "…", "skipped": "-"}.get(g.get("status"), " ")
+        print(f"  {mark} {st} {STAGE_TITLE.get(st, '')}")
+
+    # 找第一个没被确认的阶段
+    target = next((st for st in seq if (gates.get(st) or {}).get("status")
+                   not in ("approved", "skipped")), None)
+    if target is None:
+        print("\n所有阶段都已确认。下一步：生成提交清单")
+        print("  python scripts/devloop.py commit --root . --message \"...\" --bump patch")
+        return 0
+
+    g = gates.get(target) or {}
+    nxt = seq[seq.index(target) + 1] if target != seq[-1] else None
+    print()
+    if not g:
+        print(f"下一步：产出 {target}（{STAGE_TITLE[target]}）")
+        if target == "S2":
+            print("  python scripts/devloop.py stage --root . --stage S2 --base HEAD")
+        elif target == "S1":
+            print("  python scripts/devloop.py stage --root . --stage S1 --files <锚点文件>")
+        else:
+            print(f"  按 SKILL.md 的 {target} 规程做完，写成 .devloop/{STAGE_ANCHOR.get(target, target + '.md')}")
+    elif g.get("status") == "pending":
+        print(f"下一步：把 {g.get('doc')} 贴给用户看，等明确同意")
+        print(f"  报告页面：python scripts/devloop.py report --root .")
+        print(f"  同意后：gate --stage {target} --approve --note \"<用户原话>\"")
+        if nxt:
+            print(f"  然后：state --set {nxt}")
+    else:
+        print(f"{target} 状态异常（{g.get('status')}），重新登记一次。")
+    return 0
+
+
 # ----------------------------------------------------------------------------- main
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2458,6 +2881,37 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--approve", action="store_true")
     pl.add_argument("--note", default="")
     pl.set_defaults(func=cmd_gate, stage="S1")
+
+    bl = sub.add_parser("blind", help="静态分析盲区：反射/DI/动态路由")
+    bl.add_argument("--root", default=".")
+    bl.add_argument("--files", default="", help="要检查的文件，逗号分隔；省略则取当前改动")
+    bl.add_argument("--base", default="HEAD", help="对比基线，默认 HEAD")
+    bl.set_defaults(func=cmd_blind)
+
+    q = sub.add_parser("quality", help="实现质量：只看本次新增行的硬伤")
+    q.add_argument("--root", default=".")
+    q.add_argument("--base", default="HEAD", help="对比基线，默认 HEAD")
+    q.add_argument("--files", default="", help="限定文件，逗号分隔")
+    q.set_defaults(func=cmd_quality)
+
+    rp = sub.add_parser("report", help="把各阶段报告渲染成单文件 HTML")
+    rp.add_argument("--root", default=".")
+    rp.add_argument("--name", default="report.html", help="输出文件名，默认 report.html")
+    rp.add_argument("--history", action="store_true", help="列出历史报告，不重新生成")
+    rp.set_defaults(func=cmd_report)
+
+    sg = sub.add_parser("stage", help="一条命令跑完某阶段的分析、报告与登记")
+    sg.add_argument("--root", default=".")
+    sg.add_argument("--stage", default="S2", help="S1-S5，默认 S2")
+    sg.add_argument("--base", default="HEAD", help="对比基线，默认 HEAD")
+    sg.add_argument("--files", default="", help="限定文件，逗号分隔")
+    sg.add_argument("--summary", default="", help="一句话说明")
+    sg.add_argument("--log", default="", help="S5 用：报错日志文件，自动映射到文件:行")
+    sg.set_defaults(func=cmd_stage)
+
+    nx = sub.add_parser("next", help="看下一步该做什么")
+    nx.add_argument("--root", default=".")
+    nx.set_defaults(func=cmd_next)
 
     st = sub.add_parser("state", help="阶段状态")
     st.add_argument("--root", default=".")
