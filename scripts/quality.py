@@ -4,7 +4,7 @@
 这里不评判设计，只抓那些**一眼能判定的实现缺陷**：调试残留、吞异常、硬编码密钥、
 字符串拼 SQL、eval、注释掉的代码、以及改了代码却没补测试。
 
-只扫 diff 的新增行，不翻存量代码——存量问题归 S4 健康检查，两者不要混。
+只扫 diff 的新增行，不翻存量代码——存量问题归 S5 健康检查，两者不要混。
 """
 
 from __future__ import annotations
@@ -91,7 +91,8 @@ MAX_FUNC_LINES = 80
 
 def _git(root: Path, *args: str) -> tuple[int, str]:
     try:
-        p = subprocess.run(["git", *args], cwd=str(root), capture_output=True,
+        p = subprocess.run(["git", "-c", "core.quotepath=false", *args],
+                       cwd=str(root), capture_output=True,
                            encoding="utf-8", errors="replace", timeout=90)
         return p.returncode, (p.stdout or "").strip()
     except Exception as exc:  # noqa: BLE001
@@ -281,7 +282,7 @@ def scan_test_gap(files: dict[str, list[tuple[int, str]]]) -> list[dict]:
     return [{"id": "TST-01", "severity": "P1", "category": "测试缺口",
              "file": f, "line": 0, "code": "本次改动未触及任何测试文件",
              "why": "改完没补测试，回归只能靠手工，下次改动就是碰运气",
-             "fix": "补对应用例；确实无需补，在 S2 报告里写明理由"} for f in code]
+             "fix": "补对应用例；确实无需补，在 S3 报告里写明理由"} for f in code]
 
 
 def scan_oversized(files: dict[str, list[tuple[int, str]]],
@@ -468,5 +469,5 @@ def render_markdown(result: dict, base: str, when: str) -> str:
                    "", "```", h["code"], "```", "",
                    f"- 为什么：{h['why']}", f"- 怎么改：{h['fix']}", ""]
 
-    md += ["> P0 不允许豁免。P1/P2 要豁免，就在 S2 报告里逐条写理由，别默默放过。", ""]
+    md += ["> P0 不允许豁免。P1/P2 要豁免，就在 S3 报告里逐条写理由，别默默放过。", ""]
     return "\n".join(md)

@@ -6,7 +6,7 @@
   python stackmap.py --root . --text "Traceback (most recent call last): ..."
   cat err.log | python stackmap.py --root .
 
-输出: 终端摘要 + .devloop/trace.md（可用 --out 改路径）
+输出: 终端摘要 + .devloop/调用链映射.md（可用 --out 改路径）
 """
 from __future__ import annotations
 
@@ -165,7 +165,7 @@ def main() -> int:
     ap.add_argument("--root", default=".", help="仓库根目录")
     ap.add_argument("--log", help="报错日志文件")
     ap.add_argument("--text", help="直接给报错文本")
-    ap.add_argument("--out", default=".devloop/trace.md", help="输出文件")
+    ap.add_argument("--out", default=".devloop/调用链映射.md", help="输出文件")
     ap.add_argument("--pad", type=int, default=12, help="上下文行数")
     args = ap.parse_args()
 

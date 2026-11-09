@@ -17,35 +17,39 @@ from datetime import datetime
 from pathlib import Path
 
 STAGE_TITLE = {
+    "S0": "需求澄清",
     "S1": "需求影响面与技术方案",
-    "S2": "变更审计",
-    "S3": "文档同步",
-    "S4": "健康检查",
-    "S5": "缺陷定位与修复",
-    "S6": "提交",
+    "S2": "实现（TDD）",
+    "S3": "变更审计",
+    "S4": "文档同步",
+    "S5": "健康检查",
+    "S6": "缺陷定位与修复",
+    "S7": "提交",
 }
+# 文件名必须和 devloop.DEFAULT_DOC 一致：大小写错了在 Linux 上会直接找不到，
+# 页面就只剩一句「还没有报告」（Windows 因为不分大小写，一直没暴露）。
 STAGE_ANCHOR = {
-    "S1": "s1-impact.md", "S2": "s2-audit.md", "S3": "s3-docs.md",
-    "S4": "s4-health.md", "S5": "s5-fix.md", "S6": "commit-plan.md",
+    "S0": "S0-需求澄清.md", "S1": "S1-影响面与方案.md", "S2": "S2-实现.md",
+    "S3": "S3-变更审计.md", "S4": "S4-文档同步.md", "S5": "S5-健康检查.md",
+    "S6": "S6-缺陷定位.md", "S7": "S7-提交清单.md",
 }
 STATUS_TEXT = {"approved": "已确认", "pending": "待确认", "skipped": "不适用"}
 
-# 展示顺序：先阶段报告，再支撑材料
-REPORT_ORDER = [
-    ("S1", "s1-impact.md"), ("S2", "s2-audit.md"), ("S3", "s3-docs.md"),
-    ("S4", "s4-health.md"), ("S5", "s5-fix.md"), (None, "quality.md"),
-    (None, "blind-spots.md"), (None, "sensitive.md"), (None, "audit-code.md"),
-    (None, "audit-docs.md"), (None, "verify.md"), (None, "commit-plan.md"),
-    (None, "baseline-check.md"), (None, "drift.md"), (None, "impact.md"),
-    (None, "graph.md"), (None, "doc-baseline.md"),
+# 展示顺序：先阶段报告，再支撑材料（S7-提交清单.md 已经在 S7 里，不重复列）
+EXTRA_FILES = [
+    "实现质量.md", "静态盲区.md", "敏感文件预检.md", "代码对账.md",
+    "文档对账.md", "验证报告.md", "基线复核.md", "文档漂移.md",
+    "影响面.md", "依赖图.md", "文档基线.md",
 ]
+REPORT_ORDER = [(st, name) for st, name in STAGE_ANCHOR.items()] + \
+               [(None, name) for name in EXTRA_FILES]
 FILE_TITLE = {
-    "quality.md": "实现质量", "blind-spots.md": "静态分析盲区",
-    "sensitive.md": "敏感文件预检", "audit-code.md": "代码项对账",
-    "audit-docs.md": "文档项对账", "verify.md": "验证结果",
-    "commit-plan.md": "提交清单", "baseline-check.md": "文档基线复核",
-    "drift.md": "文档漂移", "impact.md": "影响面", "graph.md": "依赖图",
-    "doc-baseline.md": "文档基线",
+    "实现质量.md": "实现质量", "静态盲区.md": "静态分析盲区",
+    "敏感文件预检.md": "敏感文件预检", "代码对账.md": "代码项对账",
+    "文档对账.md": "文档项对账", "验证报告.md": "验证结果",
+    "S7-提交清单.md": "提交清单", "基线复核.md": "文档基线复核",
+    "文档漂移.md": "文档漂移", "影响面.md": "影响面", "依赖图.md": "依赖图",
+    "文档基线.md": "文档基线",
 }
 
 
@@ -265,7 +269,7 @@ def _load_json(path: Path) -> dict:
 
 def _gate_cards(gates: dict) -> str:
     cards = []
-    for st in ("S1", "S2", "S3", "S4", "S5", "S6"):
+    for st in STAGE_ANCHOR:
         g = gates.get(st) or {}
         status = g.get("status", "")
         cls = {"approved": "ok", "pending": "warn", "skipped": "gray"}.get(status, "gray")
@@ -282,7 +286,9 @@ def _gate_cards(gates: dict) -> str:
 
 
 def _stats_strip(quality_data: dict, gates: dict, state: dict) -> str:
-    approved = sum(1 for g in gates.values() if g.get("status") in ("approved", "skipped"))
+    approved = sum(1 for k, g in gates.items()
+                   if not k.startswith("_") and isinstance(g, dict)
+                   and g.get("status") in ("approved", "skipped"))
     p0 = p1 = p2 = 0
     q = quality_data.get("stats") or {}
     p0, p1, p2 = q.get("P0", 0), q.get("P1", 0), q.get("P2", 0)
@@ -301,9 +307,9 @@ def build_html(root: Path, version: str, title: str = "研发闭环 · 报告看
                seq: int = 0, prev_href: str = "") -> tuple[str, int]:
     """返回 (html, 渲染了几份报告)。"""
     out_dir = root / ".devloop"
-    gates = _load_json(out_dir / "gates.json")
-    state = _load_json(out_dir / "state.json")
-    quality_data = _load_json(out_dir / "quality.json")
+    gates = _load_json(out_dir / "确认记录.json")
+    state = _load_json(out_dir / "状态.json")
+    quality_data = _load_json(out_dir / "实现质量.json")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     round_name = state.get("round") or "—"
@@ -356,19 +362,19 @@ def build_html(root: Path, version: str, title: str = "研发闭环 · 报告看
     return body, count
 
 
-HISTORY_DIR = "history"
+HISTORY_DIR = "看板历史"
 KEEP_HISTORY = 10
 
 
 def _history_files(out_dir: Path) -> list[Path]:
-    return sorted((out_dir / HISTORY_DIR).glob("report-*.html"))
+    return sorted((out_dir / HISTORY_DIR).glob("看板-*.html"))
 
 
-def write_report(root: Path, version: str, name: str = "report.html",
+def write_report(root: Path, version: str, name: str = "看板.html",
                  keep: int = KEEP_HISTORY) -> dict:
     """渲染看板，同时留一份历史快照。
 
-    覆盖式的 report.html 只回答「现在什么样」，回答不了「上周批的是什么」。
+    覆盖式的 看板.html 只回答「现在什么样」，回答不了「上周批的是什么」。
     历史按时间戳命名，保留最近 keep 份。
     """
     out_dir = root / ".devloop"
@@ -384,7 +390,7 @@ def write_report(root: Path, version: str, name: str = "report.html",
         if m:
             seq = max(seq, int(m.group(1)) + 1)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    snap_name = f"report-{stamp}-{seq:03d}.html"
+    snap_name = f"看板-{stamp}-{seq:03d}.html"
     prev_href = f"{HISTORY_DIR}/{existing[-1].name}" if existing else ""
 
     html_text, count = build_html(root, version, seq=seq, prev_href=prev_href)

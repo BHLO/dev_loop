@@ -7,7 +7,7 @@
   python metrics.py --root . --top 30       # 控制输出条数
 
 说明: 函数级指标用 Python AST 精确计算；其他语言只给文件级指标，
-      不做假的复杂度估算。输出 markdown，便于直接贴进 .devloop/S4-health.md。
+      不做假的复杂度估算。输出 markdown，便于直接贴进 .devloop/S5-健康检查.md。
 """
 from __future__ import annotations
 

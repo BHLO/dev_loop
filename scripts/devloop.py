@@ -17,7 +17,7 @@ devloop — 研发闭环工具箱（单一入口，四阶段共用一套扫描�
   python devloop.py impact --root . --files src/api/user.py,docs/api.md
   python devloop.py graph  --root . --files src/api/user.py,src/service/order.py
   python devloop.py drift  --root .
-  python devloop.py state  --root . --set S2 --note "改完 3 个文件"
+  python devloop.py state  --root . --set S3 --note "改完 3 个文件"
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ import astindex  # noqa: E402  符号索引与盲区检测
 import quality as quality_mod  # noqa: E402  实现质量扫描
 import report as report_mod  # noqa: E402  Markdown → HTML 报告
 
-VERSION = "1.10.0"
+VERSION = "1.12.0"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -118,9 +118,11 @@ def git(root: Path, *args: str, with_stderr: bool = False):
     判断"没变化"。push 这类需要看到失败原因的场景传 with_stderr=True。
     """
     try:
+        # core.quotepath=false：中文文件名否则会被转成 "\346\226..."
+        # 这类八进制转义，路径前缀判断（比如排除 .devloop/）全部失效
         proc = subprocess.run(
-            ["git", *args], cwd=str(root), capture_output=True,
-            encoding="utf-8", errors="replace", timeout=60,
+            ["git", "-c", "core.quotepath=false", *args], cwd=str(root),
+            capture_output=True, encoding="utf-8", errors="replace", timeout=60,
         )
         text = proc.stdout.strip()
         if with_stderr and proc.returncode != 0:
@@ -185,9 +187,82 @@ def rel(root: Path, path: Path) -> str:
         return path.as_posix()
 
 
+# 1.12 起产物文件名改成中文；旧项目的英文名文件在首次运行时自动改名
+LEGACY_ARTIFACTS = {
+    "S0-clarify.md": "S0-需求澄清.md", "S1-impact.md": "S1-影响面与方案.md",
+    "S1-draft.md": "S1-素材.md", "S2-tdd.md": "S2-实现.md",
+    "S3-audit.md": "S3-变更审计.md", "S4-docs.md": "S4-文档同步.md",
+    "S5-health.md": "S5-健康检查.md", "S6-fix.md": "S6-缺陷定位.md",
+    "commit-plan.md": "S7-提交清单.md", "commit-plan.json": "S7-提交清单.json",
+    "profile.json": "项目画像.json", "state.json": "状态.json",
+    "gates.json": "确认记录.json", "gates.md": "确认状态.md",
+    "report.html": "看板.html",
+    "blind-spots.md": "静态盲区.md", "blind-spots.json": "静态盲区.json",
+    "impact.md": "影响面.md", "impact.json": "影响面.json",
+    "graph.md": "依赖图.md", "graph.mmd": "依赖图.mmd", "graph.json": "依赖图.json",
+    "quality.md": "实现质量.md", "quality.json": "实现质量.json",
+    "sensitive.md": "敏感文件预检.md",
+    "audit-code.md": "代码对账.md", "audit-docs.md": "文档对账.md",
+    "doc-baseline.json": "文档基线.json", "doc-baseline.md": "文档基线.md",
+    "baseline-check.md": "基线复核.md",
+    "drift.md": "文档漂移.md", "drift.json": "文档漂移.json",
+    "trace.md": "调用链映射.md", "verify.md": "验证报告.md",
+}
+
+
+def migrate_artifacts(root: Path) -> None:
+    """把旧版英文产物名改成中文名，并同步确认记录里的 doc 路径。
+
+    只在真的有旧文件时才动，改完写一个隐藏标记，后续调用直接返回。
+    """
+    out = root / STATE_DIR
+    if not out.is_dir() or (out / ".中文名").exists():
+        return
+    moved = 0
+    for old, new in LEGACY_ARTIFACTS.items():
+        src, dst = out / old, out / new
+        if src.exists() and not dst.exists():
+            try:
+                src.replace(dst)
+                moved += 1
+            except OSError:
+                pass
+    for old, new in (("revisions", "历史版本"), ("history", "看板历史"), ("archive", "归档")):
+        src, dst = out / old, out / new
+        if src.is_dir() and not dst.exists():
+            try:
+                src.replace(dst)
+                moved += 1
+            except OSError:
+                pass
+    for gate_file in (out / "确认记录.json", out / "gates.json"):
+        if gate_file.exists():
+            try:
+                gates = json.loads(gate_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for rec in gates.values():
+                if isinstance(rec, dict) and rec.get("doc"):
+                    for old, new in LEGACY_ARTIFACTS.items():
+                        if rec["doc"].endswith("/" + old):
+                            rec["doc"] = rec["doc"][: -len(old)] + new
+            write_json(gate_file, gates)
+    # 归档目录里的 round-01 -> 第01轮
+    arch = out / "归档"
+    if arch.is_dir():
+        for sub in arch.iterdir():
+            m = re.fullmatch(r"round-(\d+)", sub.name)
+            if m and sub.is_dir() and not (arch / f"第{m.group(1)}轮").exists():
+                sub.replace(arch / f"第{m.group(1)}轮")
+    (out / ".中文名").write_text("产物文件名已切换为中文\n", encoding="utf-8")
+    if moved:
+        print(f"[迁移] {moved} 个产物文件已改用中文名（.devloop/ 下）")
+
+
 def ensure_state_dir(root: Path) -> Path:
     d = root / STATE_DIR
     d.mkdir(parents=True, exist_ok=True)
+    migrate_artifacts(root)
     return d
 
 
@@ -197,7 +272,7 @@ def write_json(path: Path, payload) -> None:
 
 
 def load_profile(root: Path) -> dict:
-    p = root / STATE_DIR / "profile.json"
+    p = root / STATE_DIR / "项目画像.json"
     if p.exists():
         try:
             return json.loads(p.read_text(encoding="utf-8"))
@@ -336,7 +411,7 @@ def cmd_scan(args) -> int:
             "recent_commits": last.splitlines() if last else [],
         }
 
-    out = ensure_state_dir(root) / "profile.json"
+    out = ensure_state_dir(root) / "项目画像.json"
     write_json(out, info)
 
     print(f"项目画像 -> {out}")
@@ -550,7 +625,7 @@ def cmd_impact(args) -> int:
         "files": results,
     }
     out_dir = ensure_state_dir(root)
-    write_json(out_dir / "impact.json", payload)
+    write_json(out_dir / "影响面.json", payload)
 
     md = [f"# 变更影响面报告", "",
           f"- 生成时间：{payload['generated_at']}",
@@ -587,12 +662,12 @@ def cmd_impact(args) -> int:
             for s in by_cat[cat][:6]:
                 md.append(f"| {cat} | `{s['file']}:{s['line']}` | {s['why']} |")
             if len(by_cat[cat]) > 6:
-                md.append(f"| {cat} | 另有 {len(by_cat[cat]) - 6} 处 | 见 `blind-spots.md` |")
+                md.append(f"| {cat} | 另有 {len(by_cat[cat]) - 6} 处 | 见 `静态盲区.md` |")
         md += ["", "> 跨服务的调用、配置驱动的行为，静态分析一律看不见，只能人工补。", ""]
 
-    (out_dir / "impact.md").write_text("\n".join(md), encoding="utf-8")
+    (out_dir / "影响面.md").write_text("\n".join(md), encoding="utf-8")
 
-    print(f"影响面 -> {out_dir / 'impact.md'}（风险 {level}，{len(results)} 个文件）")
+    print(f"影响面 -> {out_dir / '影响面.md'}（风险 {level}，{len(results)} 个文件）")
     for r in results:
         print(f"  [{r['risk']:>3}] {r['file']}  调用方 {len(r['refs']['code'])} / "
               f"测试 {len(r['refs']['tests'])} / 文档 {len(r['refs']['docs'])}")
@@ -706,7 +781,7 @@ def cmd_drift(args) -> int:
         "docs_touching_changes": touched,
     }
     out_dir = ensure_state_dir(root)
-    write_json(out_dir / "drift.json", payload)
+    write_json(out_dir / "文档漂移.json", payload)
 
     md = ["# 文档漂移报告", "",
           f"- 生成时间：{payload['generated_at']}",
@@ -725,9 +800,9 @@ def cmd_drift(args) -> int:
             md.append(f"| `{f['doc']}` | {f['line']} | {f['kind']} | `{f['value']}` | {f['problem']} |")
     else:
         md.append("未发现路径/符号级失配。")
-    (out_dir / "drift.md").write_text("\n".join(md), encoding="utf-8")
+    (out_dir / "文档漂移.md").write_text("\n".join(md), encoding="utf-8")
 
-    print(f"文档漂移 -> {out_dir / 'drift.md'}（失配 {len(findings)} 条，"
+    print(f"文档漂移 -> {out_dir / '文档漂移.md'}（失配 {len(findings)} 条，"
           f"本次改动涉及 {len(touched)} 处文档）")
     return 0
 
@@ -779,9 +854,9 @@ def cmd_graph(args) -> int:
     if args.files:
         targets = [x.strip() for x in args.files.split(",") if x.strip()]
     else:
-        impact_path = out_dir / "impact.json"
+        impact_path = out_dir / "影响面.json"
         if not impact_path.exists():
-            print("没有指定文件，也没有 impact.json。先用 impact 生成，或传 --files。")
+            print("没有指定文件，也没有 影响面.json。先用 impact 生成，或传 --files。")
             return 2
         data = json.loads(impact_path.read_text(encoding="utf-8"))
         targets = [f["file"] for f in data["files"] if f.get("status") != "D"]
@@ -897,7 +972,7 @@ def cmd_graph(args) -> int:
     if dep_ids:
         lines.append("  class " + ",".join(dep_ids) + " dep")
 
-    (out_dir / "graph.mmd").write_text("\n".join(lines), encoding="utf-8")
+    (out_dir / "依赖图.mmd").write_text("\n".join(lines), encoding="utf-8")
 
     by_level: dict[int, list[str]] = {}
     for p in nodes:
@@ -933,9 +1008,9 @@ def cmd_graph(args) -> int:
         for (src, dst), syms in sorted(edges.items())[:120]:
             md.append(f"| `{src}` | `{dst}` | {', '.join(sorted(syms)[:4])} |")
         md.append("")
-    (out_dir / "graph.md").write_text("\n".join(md), encoding="utf-8")
+    (out_dir / "依赖图.md").write_text("\n".join(md), encoding="utf-8")
 
-    write_json(out_dir / "graph.json", {
+    write_json(out_dir / "依赖图.json", {
         "generated_at": now(),
         "targets": targets,
         "nodes": [{"file": p, "level": level_of[p]} for p in nodes],
@@ -943,7 +1018,7 @@ def cmd_graph(args) -> int:
         "truncated": cut,
     })
 
-    print(f"依赖图 -> {out_dir / 'graph.md'}（{len(nodes)} 个节点，{shown} 条边）")
+    print(f"依赖图 -> {out_dir / '依赖图.md'}（{len(nodes)} 个节点，{shown} 条边）")
     if missing:
         print(f"  待新建 {len(missing)} 个：" + "、".join(missing))
     for lv in sorted(by_level):
@@ -1073,7 +1148,9 @@ def git_status_entries(root: Path) -> list[dict]:
         code, path = m.group(1), m.group(2).strip()
         if " -> " in path:
             path = path.split(" -> ")[-1].strip()
-        if path.startswith(STATE_DIR + "/"):
+        # 万一还是带引号的转义形式，拆掉引号再判断
+        path = path.strip('"')
+        if path.startswith(STATE_DIR + "/") or path.startswith(STATE_DIR + "\\"):
             continue
         entries.append({"status": code, "file": path})
     return entries
@@ -1184,13 +1261,13 @@ def cmd_verify(args) -> int:
     if not cmd:
         md += ["## 结果", "", "**NOT RUN** —— 没有检测到测试命令。", "",
                "请在 `--cmd` 里指定，例如 `--cmd \"pytest -q\"`，或补齐项目测试脚本。", ""]
-        (out_dir / "verify.md").write_text("\n".join(md), encoding="utf-8")
+        (out_dir / "验证报告.md").write_text("\n".join(md), encoding="utf-8")
         print("NOT RUN：没有测试命令。用 --cmd 指定后重跑。")
         return 2
 
     if args.dry_run:
         md += ["## 结果", "", f"**DRY RUN** —— 将要执行：`{cmd}`", ""]
-        (out_dir / "verify.md").write_text("\n".join(md), encoding="utf-8")
+        (out_dir / "验证报告.md").write_text("\n".join(md), encoding="utf-8")
         print(f"将要执行：{cmd}")
         return 0
 
@@ -1238,8 +1315,8 @@ def cmd_verify(args) -> int:
     tail = [ln for ln in output.splitlines() if ln.strip()][-40:]
     md += ["## 输出尾部（最后 40 行）", "", "```", *tail, "```", ""]
 
-    (out_dir / "verify.md").write_text("\n".join(md), encoding="utf-8")
-    print(f"验证 -> {out_dir / 'verify.md'}（{verdict}，退出码 {code}，{elapsed}s）")
+    (out_dir / "验证报告.md").write_text("\n".join(md), encoding="utf-8")
+    print(f"验证 -> {out_dir / '验证报告.md'}（{verdict}，退出码 {code}，{elapsed}s）")
     print(f"  自测清单 {len(checklist)} 项，已写入报告")
     if ok:
         return 0
@@ -1269,13 +1346,19 @@ def worktree_signature(root: Path, entries: list[dict]) -> str:
     只比文件名不够——清单给人看过之后又改了同一行代码，文件名没变，
     但用户看到的已经不是现在要提交的东西了。
     """
+    # 不用 `git diff HEAD`：新文件在 `git add` 之前不出现、之后才出现，
+    # 同一份内容会因为「暂存了没有」算出两个指纹，清单刚出就被判成过期。
+    # 改成对「所有变更文件的内容」取指纹——和暂存状态无关。
+    rc, listed = git(root, "ls-files", "-m", "-o", "--exclude-standard")
+    files = {x.strip() for x in listed.splitlines() if x.strip()} if rc == 0 else set()
+    # 自己的产物不算「改动」：没有 .gitignore 的仓库里 .devloop/ 是未跟踪的，
+    # 清单文件本身还会在生成瞬间变一次，算进去等于让每份清单一出就过期
+    files = {f for f in files if not f.startswith(STATE_DIR + "/")}
+    files |= {e["file"] for e in entries}
     parts = []
-    _, diff = git(root, "diff", "HEAD")
-    parts.append(diff)
-    for e in entries:
-        p = root / e["file"]
-        if p.is_file():
-            parts.append(f"{e['file']}:{doc_sha(p)}")
+    for f in sorted(files):
+        p = root / f
+        parts.append(f"{f}:{doc_sha(p) if p.is_file() else 'deleted'}")
     return hashlib.sha1("\n".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
 
 
@@ -1402,7 +1485,7 @@ def cmd_commit(args) -> int:
 
     md += ["## 确认项", "", "- [ ] 文件清单无误，没有遗漏或多带",
            "- [ ] 提交信息描述准确",
-           "- [ ] 验证已通过（`.devloop/verify.md`）",
+           "- [ ] 验证已通过（`.devloop/验证报告.md`）",
            "- [ ] 敏感文件已获授权",
            "- [ ] 重大改动已打标签" if major_reasons else "", ""]
 
@@ -1418,15 +1501,15 @@ def cmd_commit(args) -> int:
                f"`{token}`", "",
                "用户看过这份清单之后，如果文件集合、提交信息或 HEAD 有任何变化，"
                "指纹就对不上，提交会被拒绝——需要重新生成清单再看一次。", ""]
-        (out_dir / "commit-plan.md").write_text("\n".join(md), encoding="utf-8")
-        write_json(out_dir / "commit-plan.json", {
+        (out_dir / "S7-提交清单.md").write_text("\n".join(md), encoding="utf-8")
+        write_json(out_dir / "S7-提交清单.json", {
             "generated_at": now(), "token": token, "message": args.message or "",
             "files": sorted(e["file"] for e in entries), "major": bool(major_reasons),
             "suggested_tag": tag, "head": git(root, "rev-parse", "HEAD")[1] or "",
             "worktree": worktree_signature(root, entries),
         })
     if not args.apply:
-        print(f"提交清单 -> {out_dir / 'commit-plan.md'}（{len(entries)} 个文件，"
+        print(f"提交清单 -> {out_dir / 'S7-提交清单.md'}（{len(entries)} 个文件，"
               f"{'重大改动' if major_reasons else '普通改动'}）")
     for s in sensitive:
         print(f"  敏感：{s['level']} {s['file']}")
@@ -1441,7 +1524,7 @@ def cmd_commit(args) -> int:
         print("--apply 需要同时给出 --message（必须是用户确认过的那份），未提交。")
         return 2
 
-    plan_json = out_dir / "commit-plan.json"
+    plan_json = out_dir / "S7-提交清单.json"
     if not plan_json.exists():
         print("没有找到本轮的提交清单。先跑一次不带 --apply 的 commit，把清单给用户过目。")
         return 2
@@ -1543,9 +1626,9 @@ def cmd_sensitive(args) -> int:
         md += ["", "把这些项写进 S1 的「待确认项」，改动前先拿到明确同意。", ""]
     else:
         md += ["无敏感文件，按清单直接改。", ""]
-    (out_dir / "sensitive.md").write_text("\n".join(md), encoding="utf-8")
+    (out_dir / "敏感文件预检.md").write_text("\n".join(md), encoding="utf-8")
 
-    print(f"敏感预检 -> {out_dir / 'sensitive.md'}（需授权 {len(hits)}：高危 {len(high)} / 中危 {len(mid)}）")
+    print(f"敏感预检 -> {out_dir / '敏感文件预检.md'}（需授权 {len(hits)}：高危 {len(high)} / 中危 {len(mid)}）")
     for h in hits:
         print(f"  {h['level']}  {h['label']}  {h['file']}")
     if high:
@@ -1598,7 +1681,7 @@ def cmd_audit(args) -> int:
     root = Path(args.root).resolve()
     out_dir = ensure_state_dir(root)
 
-    state_path = out_dir / "state.json"
+    state_path = out_dir / "状态.json"
     items = []
     if state_path.exists():
         try:
@@ -1699,7 +1782,8 @@ def cmd_audit(args) -> int:
     md += [f"- `{p}`（{changed[p]}）" for p in both if p not in {m['file'] for m in mismatched}] or ["无"]
     md += ["", "> 漏改不等于必须改：确认后可以把该项标为 SKIPPED 并写明原因。", ""]
 
-    fname = "audit.md" if scope == "all" else f"audit-{scope}.md"
+    # 文件名叫「代码对账.md / 文档对账.md / 全部对账.md」，和 else 分支的 scope_name 对齐
+    fname = f"{scope_name if scope != 'all' else '全部'}对账.md"
     (out_dir / fname).write_text("\n".join(md), encoding="utf-8")
     print(f"对账 -> {out_dir / fname}（漏改 {len(missing)} / 越界 {len(extra)} / "
           f"动作不符 {len(mismatched)} / 一致 {len(both) - len(mismatched)}）")
@@ -1715,21 +1799,28 @@ def cmd_audit(args) -> int:
 # ----------------------------------------------------------------------------- gate
 
 # 进入某阶段之前，上一阶段必须已被用户确认（或显式声明不适用）
-GATE_ORDER = ["S1", "S2", "S3", "S4", "S5", "S6"]
+GATE_ORDER = ["S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7"]
 PREV_STAGE = {GATE_ORDER[i]: GATE_ORDER[i - 1] for i in range(1, len(GATE_ORDER))}
 
+# 旧版本（1.10 及以前）是 S1..S6，语义为「影响面/审计/文档/健康/定位/提交」。
+# 升级后插入 S0 需求澄清与 S2 实现，旧键整体后移一位，见 migrate_gates。
+GATE_SCHEMA = 2
+
 DEFAULT_DOC = {
-    "S1": "S1-impact.md", "S2": "S2-audit.md", "S3": "S3-docs.md",
-    "S4": "S4-health.md", "S5": "S5-fix.md", "S6": "commit-plan.md",
+    "S0": "S0-需求澄清.md", "S1": "S1-影响面与方案.md", "S2": "S2-实现.md",
+    "S3": "S3-变更审计.md", "S4": "S4-文档同步.md", "S5": "S5-健康检查.md",
+    "S6": "S6-缺陷定位.md", "S7": "S7-提交清单.md",
 }
 
 STAGE_TITLE = {
+    "S0": "需求澄清",
     "S1": "需求影响面与技术方案",
-    "S2": "变更审计",
-    "S3": "文档同步",
-    "S4": "健康检查",
-    "S5": "缺陷定位与修复",
-    "S6": "提交",
+    "S2": "实现（TDD）",
+    "S3": "变更审计",
+    "S4": "文档同步",
+    "S5": "健康检查",
+    "S6": "缺陷定位与修复",
+    "S7": "提交",
 }
 
 # 每个阶段交给用户过目的东西：标题在不算数，得有实质内容。
@@ -1738,6 +1829,10 @@ STAGE_TITLE = {
 #         {"must_contain": str} 小节内必须出现该片段
 #         {}                    只要小节非空即可（"无" 也算有效回答）
 REQUIRED_SECTIONS = {
+    "S0": [("需求原话", ("需求原话", "原始诉求", "用户原话"), {}),
+           ("问答表", ("问答", "追问"), {"min_items": 4}),
+           ("验收标准", ("验收标准", "验收"), {"min_items": 1}),
+           ("待定与假设", ("待定", "假设", "未知"), {})],
     "S1": [("技术路线", ("技术路线", "方案选型", "选型对比"), {"min_items": 2}),
            ("实现流程", ("实现流程", "执行步骤", "实施步骤"), {"min_items": 1}),
            ("架构图", ("架构图",), {"must_contain": "```mermaid"}),
@@ -1745,14 +1840,17 @@ REQUIRED_SECTIONS = {
            # 动态调用那一类静态查不到，必须在方案里交代怎么兜
            ("静态盲区", ("盲区", "静态分析"), {}),
            ("实现约束", ("实现约束", "编码约束", "质量要求"), {})],
-    "S2": [("漏改判定", ("漏改",), {}),
+    "S2": [("验收标准与测试映射", ("映射",), {"min_items": 1}),
+           ("测试结果", ("测试结果", "全量测试", "验证结果"), {}),
+           ("回访确认", ("回访", "满足"), {})],
+    "S3": [("漏改判定", ("漏改",), {}),
            ("越界判定", ("越界",), {}),
            ("实现质量", ("实现质量", "质量",), {})],
-    "S3": [("文档判定", ("文档", "新建", "更新", "不改"), {"min_items": 1})],
-    "S4": [("问题清单", ("健康", "问题", "P0", "P1"), {})],
-    "S5": [("根因", ("根因",), {}),
+    "S4": [("文档判定", ("文档", "新建", "更新", "不改"), {"min_items": 1})],
+    "S5": [("问题清单", ("健康", "问题", "P0", "P1"), {})],
+    "S6": [("根因", ("根因",), {}),
            ("修复方案", ("修复",), {})],
-    "S6": [("提交清单", ("提交",), {})],
+    "S7": [("提交清单", ("提交",), {})],
 }
 
 HEADING_RE = re.compile(r"^(#{1,6})\s*(.+?)\s*$")
@@ -1817,23 +1915,172 @@ def check_doc_sections(stage: str, text: str) -> list[str]:
 
 
 def gates_path(root: Path) -> Path:
-    return ensure_state_dir(root) / "gates.json"
+    return ensure_state_dir(root) / "确认记录.json"
+
+
+def _cell_col(header: list[str], *keys: str) -> int | None:
+    for i, h in enumerate(header):
+        if any(k in h for k in keys):
+            return i
+    return None
+
+
+def table_rows(body: str) -> tuple[list[str], list[list[str]]]:
+    """把小节里第一张表解析成 (表头, 数据行)，单元格去空白。没有表就是 ([], [])。"""
+    block: list[str] = []
+    for line in body.splitlines():
+        if line.strip().startswith("|"):
+            block.append(line.strip())
+        elif block:
+            break
+    if not block:
+        return [], []
+    rows = [[c.strip() for c in line.strip("|").split("|")] for line in block]
+    if len(rows) >= 2 and TABLE_SEP_RE.match(block[1].strip()):
+        return rows[0], rows[2:]
+    return rows[0], rows[1:]
+
+
+# S0 追问要覆盖的四类；缺任何一类都说明需求还没问清
+CLARIFY_CATEGORIES = {
+    "目标范围": ("目标", "范围", "目的", "场景", "给谁"),
+    "边界异常": ("边界", "异常", "空值", "并发", "上限", "失败", "幂等", "重试"),
+    "验收标准": ("验收", "标准", "怎么算", "如何判断"),
+    "约束兼容": ("约束", "兼容", "性能", "安全", "规范", "不能", "存量", "迁移"),
+}
+
+# 这些填法都等于「没填」：空白、占位、以及声称「一次过」——最后这种其实是没走红阶段
+_EMPTY_ANSWERS = {"", "-", "—", "待定", "不知道", "todo", "tbd", "待补", "待填",
+                  "一次过", "直接通过", "直接绿", "不用", "n/a"}
+_PLACEHOLDERS = ("待填", "待补", "todo", "tbd", "占位", "（待", "(待")
+
+
+def _blank(cell: str) -> bool:
+    """这一格是不是没填：空、占位符、「-」，或者还留着模板里的「（待填…）」。"""
+    c = cell.strip().lower()
+    if c in _EMPTY_ANSWERS:
+        return True
+    return any(k in c for k in _PLACEHOLDERS)
+
+
+def check_clarify(text: str) -> list[str]:
+    """S0 的收敛判据：四类都问到、每条都有用户答案。
+
+    只要求「填过表」不够——空答案等于没问。所以这里逐行核答案列，
+    并要求四类里至少覆盖三类（同一类问三次不算问清）。
+    """
+    problems = []
+    body = section_body(text, ("问答", "追问"))
+    header, rows = table_rows(body)
+    if len(rows) < 4:
+        problems.append(f"问答表只有 {len(rows)} 行，至少 4 行（四类各问一条）")
+        return problems
+
+    ans = _cell_col(header, "答案", "回复", "结论")
+    cat = _cell_col(header, "类别", "维度", "类型")
+    empty = [str(i + 1) for i, r in enumerate(rows)
+             if ans is not None and ans < len(r) and _blank(r[ans])]
+    if empty:
+        problems.append(f"问答表第 {'、'.join(empty)} 行没有用户答案（问了没答不算问清）")
+
+    if cat is not None:
+        asked = set()
+        for r in rows:
+            cell = r[cat] if cat < len(r) else ""
+            for name, keys in CLARIFY_CATEGORIES.items():
+                if any(k in cell for k in keys):
+                    asked.add(name)
+        if len(asked) < 3:
+            problems.append(f"四类问题只问到 {'、'.join(sorted(asked)) or '无'}，"
+                            f"目标范围/边界异常/验收标准/约束兼容 至少覆盖三类")
+    return problems
+
+
+def check_tdd(text: str) -> list[str]:
+    """S2 的 TDD 判据：每条验收标准都有测试，且留了先红后绿的证据。
+
+    一张表同时承载映射与证据（验收标准 | 测试 | 先红 | 后绿）。
+    只写「已实现」而不写失败输出，说明没走红阶段——那是先写代码再补测试。
+    """
+    problems = []
+    body = section_body(text, ("映射",))
+    header, rows = table_rows(body)
+    if not rows:
+        problems.append("验收标准与测试映射表是空的：每条验收标准都要落到一个测试上")
+        return problems
+
+    t_col = _cell_col(header, "测试")
+    r_col = _cell_col(header, "红", "失败")
+    g_col = _cell_col(header, "绿", "通过")
+    a_col = _cell_col(header, "验收", "标准", "AC")
+
+    for i, r in enumerate(rows, 1):
+        def cell(c: int | None) -> str:
+            return (r[c] if c is not None and c < len(r) else "").strip()
+
+        ac = cell(a_col)
+        tag = (ac[:18] + "…") if len(ac) > 18 else (ac or f"第 {i} 行")
+        if t_col is not None and _blank(cell(t_col)):
+            problems.append(f"{tag}：没有对应测试")
+        if r_col is not None and _blank(cell(r_col)):
+            problems.append(f"{tag}：缺红色证据（先写失败测试并留输出，再实现）")
+        if g_col is not None and _blank(cell(g_col)):
+            problems.append(f"{tag}：缺绿色证据（实现后跑通的输出）")
+
+    # 回访确认要真的有一条记录：光把「去问用户」这句说明留着不算
+    back = section_body(text, ("回访", "满足"))
+    if count_items(back) < 1 or not any(k in back for k in
+                                        ("确认", "满足", "同意", "打回", "「", "用户")):
+        problems.append("回访确认：没有记录用户对「实现是否满足需求」的答复")
+    return problems
 
 
 def load_gates(root: Path) -> dict:
+    """读确认记录；旧版本（S1..S6）的键自动后移一位，避免被当成新阶段的记录。"""
     p = gates_path(root)
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        gates = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    return migrate_gates(root, gates)
+
+
+def write_gates(root: Path, gates: dict) -> None:
+    """写确认记录，顺手打上 schema 标记——没有标记的都被当成 1.10 的旧格式。"""
+    gates["_schema"] = GATE_SCHEMA
+    write_json(gates_path(root), gates)
+
+
+def stage_gates(gates: dict) -> dict:
+    """只留阶段记录：确认记录.json 里还有 _schema 这类元数据键，不能当阶段读。"""
+    return {k: v for k, v in gates.items() if not k.startswith("_")}
+
+
+def migrate_gates(root: Path, gates: dict) -> dict:
+    """1.10 及以前的 确认记录.json 用 S1..S6 表示「影响面/审计/文档/健康/定位/提交」。
+
+    1.11 插入 S0 与 S2 后同一串键含义整体后移，若不迁移，旧的 S2（审计）
+    会被当成新的 S2（实现），门禁直接放行。这里按键位移并写回。
+    """
+    if not gates or gates.get("_schema") == GATE_SCHEMA:
+        return gates
+    # 旧 S1（影响面与方案）对应新 S1，不用动；旧 S2..S6 整体后移一位
+    shifted = {}
+    for k, v in gates.items():
+        m = re.fullmatch(r"S([2-6])", k)
+        shifted[f"S{int(m.group(1)) + 1}" if m else k] = v
+    shifted["_schema"] = GATE_SCHEMA
+    write_json(gates_path(root), shifted)
+    print("[migrate] 阶段编号已升级为 S0–S7，旧的 S1–S6 确认记录整体后移一位")
+    return shifted
 
 
 def gate_sig(files: list[str], doc: Path | None) -> str:
     """指纹只覆盖两样：清单文件集合 + 阶段报告内容。
 
-    不覆盖整个工作区——S2 之后代码本来就在改，覆盖 worktree 会让每次批准都失效。
+    不覆盖整个工作区——S3 之后代码本来就在改，覆盖 worktree 会让每次批准都失效。
     报告被改过 = 用户看到的已经不是这份了。
     """
     body = "|".join(sorted(files))
@@ -1871,7 +2118,7 @@ def cmd_gate(args) -> int:
             md.append(f"| {st} | {STAGE_TITLE[st]} | {rev} | {names.get(g.get('status'), '?')} | "
                       f"{g.get('at', '')} | {g.get('note', '') or '—'} |")
         md += ["", "> 待确认的阶段，agent 必须停下等用户点头；不许自行推进。", ""]
-        (out_dir / "gates.md").write_text("\n".join(md), encoding="utf-8")
+        (out_dir / "确认状态.md").write_text("\n".join(md), encoding="utf-8")
         print("\n".join(md))
         return 0
 
@@ -1899,7 +2146,7 @@ def cmd_gate(args) -> int:
         g["status"] = "pending"
         g["note"] = ""
         gates[stage] = g
-        write_json(gates_path(root), gates)
+        write_gates(root, gates)
 
         print(f"{stage}（{STAGE_TITLE[stage]}）已退回待确认，接下来是第 {next_rev} 版。")
         print(f"  用户意见：{args.note.strip()}")
@@ -1915,7 +2162,7 @@ def cmd_gate(args) -> int:
             return 2
         gates[stage] = {"at": now(), "status": "skipped", "summary": args.summary or "",
                         "files": [], "doc": "", "signature": "", "note": args.note.strip()}
-        write_json(gates_path(root), gates)
+        write_gates(root, gates)
         nxt = GATE_ORDER[GATE_ORDER.index(stage) + 1] if stage != GATE_ORDER[-1] else None
         print(f"{stage}（{STAGE_TITLE[stage]}）标记为不适用"
               + (f"——可以进入 {nxt}。" if nxt else "——流程结束。"))
@@ -1953,7 +2200,7 @@ def cmd_gate(args) -> int:
         g["at"] = now()
         g["note"] = args.note.strip()
         gates[stage] = g
-        write_json(gates_path(root), gates)
+        write_gates(root, gates)
 
         nxt = GATE_ORDER[GATE_ORDER.index(stage) + 1] if stage != GATE_ORDER[-1] else None
         if args.approve:
@@ -1982,6 +2229,11 @@ def cmd_gate(args) -> int:
 
     text = read_text(doc_path, limit=1_000_000)
     missing = check_doc_sections(stage, text)
+    # S0 与 S2 光有小节不够：一个要真问过并拿到答案，一个要真走过红绿
+    if stage == "S0":
+        missing += check_clarify(text)
+    elif stage == "S2":
+        missing += check_tdd(text)
     if missing:
         print(f"{stage} 报告不达要求，不予登记：")
         for item in missing:
@@ -2008,7 +2260,7 @@ def cmd_gate(args) -> int:
     if rev == 0:
         rev = 1
 
-    snap_dir = out_dir / "revisions"
+    snap_dir = out_dir / "历史版本"
     snap_dir.mkdir(exist_ok=True)
     diff_lines: list[str] = []
     if not same_doc and prev_rev:
@@ -2027,7 +2279,7 @@ def cmd_gate(args) -> int:
         "files": sorted(files), "doc": rel(root, doc_path), "signature": signature,
         "note": "", "revision": rev, "doc_sha": cur_sha, "revisions": revisions,
     }
-    write_json(gates_path(root), gates)
+    write_gates(root, gates)
 
     md = [f"# {stage} · {STAGE_TITLE[stage]}（第 {rev} 版 · 待用户确认）", "",
           f"- 登记时间：{gates[stage]['at']}",
@@ -2060,10 +2312,10 @@ def cmd_gate(args) -> int:
            f"4. 用户提了意见：`gate --stage {stage} --revise --note \"意见原话\"`，改完再登记",
            "5. 这个阶段不适用时：`gate --stage " + stage + " --skip --note \"为什么不需要\"`",
            f"6. 然后才能 `state --set {GATE_ORDER[min(GATE_ORDER.index(stage) + 1, 5)]}`", ""]
-    (out_dir / f"{stage}-gate.md").write_text("\n".join(md), encoding="utf-8")
+    (out_dir / f"{stage}-确认单.md").write_text("\n".join(md), encoding="utf-8")
 
     tag = f"第 {rev} 版" + (f"，改动 {len([d for d in diff_lines if d.startswith(('+', '-'))])} 行" if diff_lines else "")
-    print(f"{stage} 已登记待确认 -> {out_dir / f'{stage}-gate.md'}（{len(files)} 个文件，{tag}）")
+    print(f"{stage} 已登记待确认 -> {out_dir / f'{stage}-确认单.md'}（{len(files)} 个文件，{tag}）")
 
     # 登记即出页面：少一条命令，也保证「贴给用户的东西」一定存在
     try:
@@ -2099,7 +2351,7 @@ def doc_sha(path: Path) -> str:
 def cmd_baseline(args) -> int:
     root = Path(args.root).resolve()
     out_dir = ensure_state_dir(root)
-    path = out_dir / "doc-baseline.json"
+    path = out_dir / "文档基线.json"
 
     if args.check:
         if not path.exists():
@@ -2123,14 +2375,14 @@ def cmd_baseline(args) -> int:
               f"- 基线时间：{data.get('generated_at', '?')}",
               f"- 基线提交：{data.get('commit', '?')}",
               f"- 文档数：{len(data.get('docs', []))}", ""]
-        md += ["## 失效（需要回 S3）", ""]
+        md += ["## 失效（需要回 S4）", ""]
         md += [f"- `{b['file']}`：{b['why']}" for b in broken] or ["无"]
         md += ["", "## 内容已变（确认是否与本次代码改动有关）", ""]
         md += [f"- `{f}`" for f in changed] or ["无"]
         md += ["", "> 锚点丢失比内容变化严重：说明文档已经不再描述当前的代码符号。", ""]
-        (out_dir / "baseline-check.md").write_text("\n".join(md), encoding="utf-8")
+        (out_dir / "基线复核.md").write_text("\n".join(md), encoding="utf-8")
 
-        print(f"基线检查 -> {out_dir / 'baseline-check.md'}（失效 {len(broken)} / 内容已变 {len(changed)}）")
+        print(f"基线检查 -> {out_dir / '基线复核.md'}（失效 {len(broken)} / 内容已变 {len(changed)}）")
         for b in broken:
             print(f"  失效：{b['file']} —— {b['why']}")
         return 1 if broken else 0
@@ -2158,8 +2410,8 @@ def cmd_baseline(args) -> int:
           "| 文档 | 行数 | 锚点数 |", "|---|---|---|"]
     for d in docs:
         md.append(f"| `{d['file']}` | {d['lines']} | {len(d['anchors'])} |")
-    md += ["", "下一轮 S2 之后跑 `baseline --check` 复核；锚点丢失就回 S3。", ""]
-    (out_dir / "doc-baseline.md").write_text("\n".join(md), encoding="utf-8")
+    md += ["", "下一轮 S3 之后跑 `baseline --check` 复核；锚点丢失就回 S4。", ""]
+    (out_dir / "文档基线.md").write_text("\n".join(md), encoding="utf-8")
 
     print(f"文档基线 -> {path}（{len(docs)} 个文档，{sum(len(d['anchors']) for d in docs)} 个锚点）")
     return 0
@@ -2187,7 +2439,7 @@ def cmd_check_commit(args) -> int:
     """commit-msg hook 调用：没走过 `commit` 清单的提交，一律拒绝。"""
     root = Path(args.root).resolve()
     out_dir = ensure_state_dir(root)
-    plan_json = out_dir / "commit-plan.json"
+    plan_json = out_dir / "S7-提交清单.json"
 
     if not plan_json.exists():
         print("[dev-loop] 拒绝提交：没有提交清单。")
@@ -2198,7 +2450,7 @@ def cmd_check_commit(args) -> int:
     try:
         saved = json.loads(plan_json.read_text(encoding="utf-8"))
     except Exception:
-        print("[dev-loop] 拒绝提交：commit-plan.json 解析失败，重新出一份清单。")
+        print("[dev-loop] 拒绝提交：S7-提交清单.json 解析失败，重新出一份清单。")
         return 1
 
     msg = ""
@@ -2284,9 +2536,44 @@ def cmd_install_hook(args) -> int:
 
 # ----------------------------------------------------------------------------- state
 
+def cmd_check(args) -> int:
+    """只校验报告够不够格，不登记。
+
+    改报告时反复用：不用每改一版就走一遍登记，也不会产生「看过但不是这版」的指纹。
+    """
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+    stage = (args.stage or "").upper()
+    if stage not in DEFAULT_DOC:
+        print(f"未知阶段 {stage}，可选：{'、'.join(GATE_ORDER)}")
+        return 2
+    doc = Path(args.doc) if args.doc else out_dir / DEFAULT_DOC[stage]
+    if not doc.is_absolute():
+        doc = root / doc
+    if not doc.exists():
+        print(f"找不到报告：{doc}")
+        return 2
+
+    text = read_text(doc, limit=1_000_000)
+    problems = check_doc_sections(stage, text)
+    if stage == "S0":
+        problems += check_clarify(text)
+    elif stage == "S2":
+        problems += check_tdd(text)
+
+    if not problems:
+        print(f"{stage}（{STAGE_TITLE[stage]}）报告达标，可以 gate 登记。")
+        return 0
+    print(f"{stage}（{STAGE_TITLE[stage]}）报告还差 {len(problems)} 项：")
+    for item in problems:
+        print(f"  - {item}")
+    print(f"  报告：{rel(root, doc)}")
+    return 1
+
+
 def cmd_state(args) -> int:
     root = Path(args.root).resolve()
-    path = ensure_state_dir(root) / "state.json"
+    path = ensure_state_dir(root) / "状态.json"
     if path.exists():
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
@@ -2299,7 +2586,7 @@ def cmd_state(args) -> int:
     state.setdefault("open_items", [])
     state.setdefault("created_at", now())
 
-    # 阶段名统一归一化：`--set s2` 曾经能绕过整道门（不匹配 S2，直接写进 state）
+    # 阶段名统一归一化：`--set s2` 曾经能绕过整道门（不匹配 S3，直接写进 state）
     if args.set:
         normalized = args.set.strip().upper()
         if normalized not in GATE_ORDER and normalized != "IDLE":
@@ -2310,12 +2597,12 @@ def cmd_state(args) -> int:
     # --round 是重置，--set 是跳阶段；一起给等于清空记录的同时跳过去
     if args.round and args.set:
         print("--round 和 --set 不能同时给。")
-        print("  开新一轮：state --round <需求名>（会回到 S1）")
+        print("  开新一轮：state --round <需求名>（会回到 S0）")
         print(f"  进入阶段：`state --set {args.set}`（需要上一阶段已确认）")
         return 2
 
     if args.set in PREV_STAGE:
-        # 检查整条链，不只看上一级：S1 没确认就批 S2，进 S3 时也要拦住
+        # 检查整条链，不只看上一级：S1 没确认就批 S3，进 S4 时也要拦住
         gates_all = load_gates(root)
         for st in GATE_ORDER[:GATE_ORDER.index(args.set)]:
             g = gates_all.get(st)
@@ -2353,26 +2640,26 @@ def cmd_state(args) -> int:
         state["rounds"] = state["rounds"][-20:]
         state["open_items"] = []
         state["round"] = args.round
-        state["stage"] = "S1"
-        state["history"].append({"at": now(), "stage": "S1", "note": f"新一轮：{args.round}"})
+        state["stage"] = "S0"
+        state["history"].append({"at": now(), "stage": "S0", "note": f"新一轮：{args.round}"})
         # 上一轮的报告不能留在原地——新一轮登记时会被误当成这一轮的产出
         out_dir = ensure_state_dir(root)
-        arch_dir = out_dir / "archive" / f"round-{len(state['rounds']):02d}"
+        arch_dir = out_dir / "归档" / f"第{len(state['rounds']):02d}轮"
         moved = 0
         for name in list(DEFAULT_DOC.values()) + [
-                "commit-plan.json", "verify.md", "gates.md", "sensitive.md",
-                "audit-code.md", "audit-docs.md", "graph.md", "impact.md",
-                "drift.md", "doc-baseline.json", "baseline-check.md"]:
+                "S7-提交清单.json", "验证报告.md", "确认状态.md", "敏感文件预检.md",
+                "代码对账.md", "文档对账.md", "依赖图.md", "影响面.md",
+                "文档漂移.md", "文档基线.json", "基线复核.md"]:
             f = out_dir / name
             if f.exists():
                 arch_dir.mkdir(parents=True, exist_ok=True)
                 f.replace(arch_dir / name)
                 moved += 1
-        for stale in [gates_path(root)] + [out_dir / f"{st}-gate.md" for st in GATE_ORDER]:
+        for stale in [gates_path(root)] + [out_dir / f"{st}-确认单.md" for st in GATE_ORDER]:
             if stale.exists():
                 stale.unlink()
         extra = f"，归档上一轮产物 {moved} 个到 archive/round-{len(state['rounds']):02d}" if moved else ""
-        print(f"新一轮「{args.round}」：已归档上一轮清单（{len(archived)} 项）{extra}，阶段重置为 S1。")
+        print(f"新一轮「{args.round}」：已归档上一轮清单（{len(archived)} 项）{extra}，阶段重置为 S0（需求澄清）。")
 
     if args.set:
         state["stage"] = args.set
@@ -2395,7 +2682,7 @@ def cmd_state(args) -> int:
             "stage": state["stage"],
             "round": state.get("round", ""),
             "note": state.get("note", ""),
-            "gates": {k: v.get("status") for k, v in gates.items()},
+            "gates": {k: v.get("status") for k, v in stage_gates(gates).items()},
             "open_items": [i for i in state["open_items"] if not i["done"]],
             "history": state["history"][-6:],
         }, ensure_ascii=False, indent=2))
@@ -2453,12 +2740,12 @@ def cmd_blind(args) -> int:
                 md.append(f"| `{s['file']}:{s['line']}` | `{code}` | {s['action']} |")
             md.append("")
 
-    (out_dir / "blind-spots.md").write_text("\n".join(md), encoding="utf-8")
-    write_json(out_dir / "blind-spots.json", {"files": files, "count": len(spots),
+    (out_dir / "静态盲区.md").write_text("\n".join(md), encoding="utf-8")
+    write_json(out_dir / "静态盲区.json", {"files": files, "count": len(spots),
                                               "by_category": {k: len(v) for k, v in by_cat.items()},
                                               "spots": spots})
 
-    print(f"盲区 -> {out_dir / 'blind-spots.md'}（{len(spots)} 处，{len(by_cat)} 类）")
+    print(f"盲区 -> {out_dir / '静态盲区.md'}（{len(spots)} 处，{len(by_cat)} 类）")
     for cat in sorted(by_cat):
         print(f"  {cat} {len(by_cat[cat])} 处")
     if spots:
@@ -2482,11 +2769,11 @@ def cmd_quality(args) -> int:
         return 2
 
     md = quality_mod.render_markdown(result, args.base, now())
-    (out_dir / "quality.md").write_text(md, encoding="utf-8")
-    write_json(out_dir / "quality.json", {**result["stats"], "hits": result["hits"]})
+    (out_dir / "实现质量.md").write_text(md, encoding="utf-8")
+    write_json(out_dir / "实现质量.json", {**result["stats"], "hits": result["hits"]})
 
     stats = result["stats"]
-    print(f"实现质量 -> {out_dir / 'quality.md'}"
+    print(f"实现质量 -> {out_dir / '实现质量.md'}"
           f"（P0 {stats['P0']} / P1 {stats['P1']} / P2 {stats['P2']}，"
           f"{stats['files']} 个文件 +{stats['added_lines']} 行）")
     for h in result["hits"][:8]:
@@ -2495,7 +2782,7 @@ def cmd_quality(args) -> int:
     if len(result["hits"]) > 8:
         print(f"  …… 另有 {len(result['hits']) - 8} 处，见报告")
     if stats["P0"]:
-        print("  P0 必须改完才能继续；P1/P2 可在 S2 报告里写明豁免理由。")
+        print("  P0 必须改完才能继续；P1/P2 可在 S3 报告里写明豁免理由。")
     return quality_mod.exit_code(stats)
 
 
@@ -2558,12 +2845,12 @@ def _demote_md(text: str, levels: int = 1) -> str:
 
 
 def _compose_s2(root: Path, out_dir: Path, base: str) -> tuple[str, list[str]]:
-    """把 audit / quality / blind 三份结果拼成 S2 的审计报告。"""
-    audit_md = read_text(out_dir / "audit-code.md")
-    quality_md = read_text(out_dir / "quality.md")
-    blind_md = read_text(out_dir / "blind-spots.md")
+    """把 audit / quality / blind 三份结果拼成 S3 的审计报告。"""
+    audit_md = read_text(out_dir / "代码对账.md")
+    quality_md = read_text(out_dir / "实现质量.md")
+    blind_md = read_text(out_dir / "静态盲区.md")
 
-    parts = ["# S2 变更审计", "", f"- 生成时间：{now()}", f"- 对比基线：{base}", ""]
+    parts = ["# S3 变更审计", "", f"- 生成时间：{now()}", f"- 对比基线：{base}", ""]
     for title, key in (("漏改", "漏改"), ("越界", "越界"),
                        ("动作不符", "动作不符"), ("一致", "一致")):
         body = _section_of(audit_md, key) or "无"
@@ -2589,6 +2876,126 @@ def _register_gate(root: Path, stage: str, files: list[str], doc: Path,
     return cmd_gate(ns)
 
 
+CLARIFY_BANK = [
+    ("目标范围", "这次要解决的具体问题是什么？（谁、什么场景、现在怎么难受）"),
+    ("目标范围", "涉及哪些入口（接口/页面/定时任务/消息）？有没有明确不做的范围？"),
+    ("边界异常", "空值、默认值、超大值、重复提交分别怎么处理？"),
+    ("边界异常", "失败/超时/重试要不要幂等？事务边界卡在哪一层？"),
+    ("验收标准", "怎么判断做完了？逐条给可测的标准（带数值或可观察结果）。"),
+    ("验收标准", "谁来验、在哪个环境验、用什么数据验？"),
+    ("约束兼容", "存量数据和老接口要不要兼容？能否加表、加字段、改签名？"),
+    ("约束兼容", "性能、权限、审计日志有硬要求吗？能不能引入新依赖？"),
+]
+
+
+def state_round(root: Path) -> str:
+    p = ensure_state_dir(root) / "状态.json"
+    if not p.exists():
+        return ""
+    try:
+        return json.loads(p.read_text(encoding="utf-8")).get("round", "") or ""
+    except Exception:
+        return ""
+
+
+def _extract_acs(text: str) -> list[str]:
+    """把 S0 报告里「验收标准」一节的条目抽出来，给 S2 的映射表打底。"""
+    body = section_body(text, ("验收标准", "验收"))
+    out: list[str] = []
+    for line in body.splitlines():
+        s = line.strip()
+        if not s or TABLE_SEP_RE.match(s):
+            continue
+        m = re.match(r"^(?:[-*+]|\d+[.)])\s+(.+)$", s)
+        if m:
+            out.append(re.sub(r"^AC\d+\s*[:：]?\s*", "", m.group(1)).strip())
+            continue
+        if s.startswith("|"):
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            if any(re.match(r"(?i)^ac\d+", c) for c in cells[:2]):
+                out.append(next((c for c in cells if c), s))
+    return out
+
+
+def profile_languages(prof: dict) -> str:
+    """把画像里的语言读成一行人话。
+
+    scan 写的是 ``[{"lang": "Python", "files": 3}]``；早先手写过的画像可能是
+    ``{"Python": 3}``。两种都认，读不出来就直说未扫描——不能因为画像形状不对就崩。
+    """
+    raw = prof.get("languages")
+    if isinstance(raw, list):
+        parts = [f"{x.get('lang', '?')}({x.get('files', 0)})"
+                 for x in raw if isinstance(x, dict) and x.get("lang")]
+        return "、".join(parts) or "未扫描"
+    if isinstance(raw, dict):
+        parts = [f"{k}({v})" for k, v in raw.items() if k]
+        return "、".join(parts) or "未扫描"
+    return "未扫描"
+
+
+def profile_test_cmd(prof: dict) -> str:
+    """画像里的测试命令在 commands.test（verify 也从这里读），没有就提示自己指定。"""
+    cmds = prof.get("commands")
+    if isinstance(cmds, dict):
+        cmd = cmds.get("test") or ""
+        if isinstance(cmd, str) and cmd.strip():
+            return cmd.strip()
+    return "（verify 时指定 --cmd）"
+
+
+def _clarify_draft(round_name: str, langs: str, test_cmd: str) -> str:
+    rows = "\n".join(f"| {c} | {q} |  |  |" for c, q in CLARIFY_BANK)
+    return (
+        "# S0 需求澄清\n\n"
+        f"- 生成时间：{now()}\n"
+        f"- 轮次：{round_name or '（未命名，建议先 state --round \"<需求名>\"）'}\n"
+        f"- 技术栈：{langs}\n"
+        f"- 测试命令：{test_cmd}\n\n"
+        "> 下面是要填的骨架。**问答表必须填用户的原话/明确答复**，不许自己编。\n"
+        "> 用弹窗追问：每轮 3–4 个问题，一次问一类，问完把答案写回表格再问下一轮。\n\n"
+        "## 需求原话\n\n"
+        "> 原样粘贴用户这一轮的需求描述，不要改写、不要总结。\n\n"
+        "## 问答表\n\n"
+        "| 类别 | 问题 | 用户答案 | 对方案的影响 |\n|---|---|---|---|\n"
+        f"{rows}\n\n"
+        "## 验收标准\n\n"
+        "> 逐条写成可测的句子（含数值或可观察结果），S2 会把每条映射到一个测试。\n"
+        "> 一条都没有就是没问清——`gate` 会拒收。\n\n"
+        "## 待定与假设\n\n"
+        "> 还没定的、我先替你假设的，逐条列出来。没有就写「无」。\n\n"
+        "## 弹窗记录\n\n"
+        "| 轮次 | 时间 | 问了什么 | 用户怎么回 |\n|---|---|---|---|\n"
+        "| 1 |  |  |  |\n"
+    )
+
+
+def _tdd_draft(acs: list[str], base: str, files: list[str]) -> str:
+    if acs:
+        rows = "\n".join(f"| AC{i} | {a} | （待填：tests/…::用例名） | （待填：先跑一次，把失败输出贴这里） | （待填） |"
+                         for i, a in enumerate(acs, 1))
+    else:
+        rows = "| AC1 | （S0 里没有验收标准，回去补） |  |  |  |"
+    file_list = "\n".join(f"- `{f}`" for f in files) or "- （还没有改动，实现后这里列出来）"
+    return (
+        "# S2 实现（TDD）\n\n"
+        f"- 生成时间：{now()}\n- 对比基线：{base}\n\n"
+        "## 验收标准与测试映射\n\n"
+        "> 一张表管两件事：每条验收标准落到哪个测试、红绿两次的输出各是什么。\n"
+        "> 红色证据写「先写测试、还没实现时」的输出；绿色证据写「实现完再跑」的输出。\n\n"
+        "| # | 验收标准 | 测试（文件::用例） | 先红（失败输出摘要） | 后绿（通过输出摘要） |\n"
+        "|---|---|---|---|---|\n"
+        f"{rows}\n\n"
+        "## 改动文件\n\n" + file_list + "\n\n"
+        "## 测试结果\n\n"
+        "> 全量命令与结果（不是只跑新加的那几个）。\n\n"
+        "## 回访确认\n\n"
+        "> 实现完逐条问用户「这条满足了吗」，把他的原话记这里；不满足的打回重做。\n\n"
+        "## 豁免\n\n"
+        "> 纯文档/配置/样式改动可以申请豁免，写清理由；S3 审计会复核这条豁免。\n"
+    )
+
+
 def cmd_stage(args) -> int:
     """一条命令跑完某阶段的机械部分：分析 → 拼报告 → 登记确认门。"""
     root = Path(args.root).resolve()
@@ -2603,7 +3010,33 @@ def cmd_stage(args) -> int:
 
     print(f"[{stage}] 开始：{len(files)} 个文件，基线 {base}")
 
+    if stage == "S0":
+        doc = out_dir / "S0-需求澄清.md"
+        if doc.exists():
+            print(f"{doc} 已存在，不覆盖。要重开一轮请先 state --round \"<需求名>\"。")
+            return 0
+        prof = load_profile(root)
+        langs = profile_languages(prof)
+        test_cmd = profile_test_cmd(prof)
+        doc.write_text(_clarify_draft(state_round(root), langs, test_cmd), encoding="utf-8")
+        report_mod.write_report(root, VERSION)
+        print(f"\n初稿 -> {doc}")
+        print("下一步：用弹窗把四类问题问完（每轮 3–4 个），答案填进「问答表」")
+        print("  四类：目标范围 / 边界异常 / 验收标准 / 约束兼容")
+        print("  gate 会拒收：答案列为空、四类覆盖不到三类、验收标准少于 1 条")
+        return 0
+
     if stage == "S2":
+        acs = _extract_acs(read_text(out_dir / DEFAULT_DOC["S0"]))
+        doc = out_dir / "S2-实现.md"
+        doc.write_text(_tdd_draft(acs, base, files), encoding="utf-8")
+        report_mod.write_report(root, VERSION)
+        print(f"\n初稿 -> {doc}")
+        print(f"从 S0 抄来 {len(acs)} 条验收标准；每条先写失败测试、留红色输出，再实现")
+        print("  豁免：纯文档/配置改动可 gate --stage S2 --skip --note \"无行为变更\"")
+        return 0
+
+    if stage == "S3":
         # 对账
         rc_audit = cmd_audit(argparse.Namespace(root=str(root), base=base, scope="code"))
         # 实现质量
@@ -2612,16 +3045,16 @@ def cmd_stage(args) -> int:
         cmd_blind(argparse.Namespace(root=str(root), base=base, files=",".join(files)))
 
         composed, _ = _compose_s2(root, out_dir, base)
-        doc = out_dir / "S2-audit.md"
+        doc = out_dir / "S3-变更审计.md"
         doc.write_text(composed, encoding="utf-8")
         print(f"审计报告 -> {doc}")
 
         code_files = [f for f in files if Path(f).suffix.lower() in CODE_EXTS]
-        rc = _register_gate(root, "S2", code_files or files, doc,
-                            args.summary or f"S2 {len(files)} 个文件")
+        rc = _register_gate(root, "S3", code_files or files, doc,
+                            args.summary or f"S3 {len(files)} 个文件")
         # gate 登记时已经生成过页面，这里不再重复
-        print(f"\n下一步：present_files 打开 {out_dir / 'report.html'} 给用户看，"
-              f"等他确认后 gate --stage S2 --approve --note \"<原话>\"")
+        print(f"\n下一步：present_files 打开 {out_dir / '看板.html'} 给用户看，"
+              f"等他确认后 gate --stage S3 --approve --note \"<原话>\"")
         return 0 if rc == 0 else rc
     if stage == "S1":
         # 机器能做的部分：影响面、依赖图、盲区、敏感预检
@@ -2634,10 +3067,10 @@ def cmd_stage(args) -> int:
         cmd_blind(argparse.Namespace(root=str(root), base=base, files=",".join(files)))
         cmd_sensitive(argparse.Namespace(root=str(root), files=",".join(files)))
 
-        manifest = read_text(out_dir / "impact.md")
-        graph_md = read_text(out_dir / "graph.md")
-        blind_md = read_text(out_dir / "blind-spots.md")
-        draft = out_dir / "S1-draft.md"
+        manifest = read_text(out_dir / "影响面.md")
+        graph_md = read_text(out_dir / "依赖图.md")
+        blind_md = read_text(out_dir / "静态盲区.md")
+        draft = out_dir / "S1-素材.md"
         draft.write_text(
             "# S1 素材（脚本产出，待补方案）\n\n"
             f"- 生成时间：{now()}\n- 锚点文件：{len(files)} 个\n\n"
@@ -2650,16 +3083,16 @@ def cmd_stage(args) -> int:
         report_mod.write_report(root, VERSION)
         print(f"\n素材 -> {draft}")
         print("还需要你写：技术路线（≥2 条）、实现流程、架构图（mermaid）、改造清单（含理由）")
-        print(f"写完存成 {out_dir / 'S1-impact.md'}，再 gate --stage S1 --files ... --doc ...")
+        print(f"写完存成 {out_dir / 'S1-影响面与方案.md'}，再 gate --stage S1 --files ... --doc ...")
         return 0
 
-    if stage == "S3":
+    if stage == "S4":
         cmd_drift(argparse.Namespace(root=str(root), docs="", changed=",".join(files)))
         cmd_audit(argparse.Namespace(root=str(root), base=base, scope="docs"))
-        drift_md = read_text(out_dir / "drift.md")
-        doc = out_dir / "S3-docs.md"
+        drift_md = read_text(out_dir / "文档漂移.md")
+        doc = out_dir / "S4-文档同步.md"
         doc.write_text(
-            "# S3 文档同步（脚本初稿）\n\n"
+            "# S4 文档同步（脚本初稿）\n\n"
             f"- 生成时间：{now()}\n\n"
             "## 文档现状\n\n" + (drift_md or "（无漂移检测结果）") + "\n\n"
             "## 逐文档判定\n\n"
@@ -2668,10 +3101,10 @@ def cmd_stage(args) -> int:
             encoding="utf-8")
         report_mod.write_report(root, VERSION)
         print(f"\n初稿 -> {doc}")
-        print("把「逐文档判定」表填完（每行必须给依据），再 gate --stage S3 ...")
+        print("把「逐文档判定」表填完（每行必须给依据），再 gate --stage S4 ...")
         return 0
 
-    if stage == "S4":
+    if stage == "S5":
         # 健康检查的机器部分：客观指标 + 本次改动质量 + 盲区
         cmd_quality(argparse.Namespace(root=str(root), base=base, files=",".join(files)))
         cmd_blind(argparse.Namespace(root=str(root), base=base, files=",".join(files)))
@@ -2682,9 +3115,9 @@ def cmd_stage(args) -> int:
                                    capture_output=True, encoding="utf-8",
                                    errors="replace", cwd=str(root))
             metrics_out = (mproc.stdout or "").strip()
-        doc = out_dir / "S4-health.md"
+        doc = out_dir / "S5-健康检查.md"
         doc.write_text(
-            "# S4 健康检查（脚本初稿）\n\n"
+            "# S5 健康检查（脚本初稿）\n\n"
             f"- 生成时间：{now()}\n- 范围：{'本次改动 ' + str(len(files)) + ' 个文件' if files else '全仓'}\n\n"
             "## 健康指标\n\n" + (_demote_md(metrics_out) or "（metrics.py 没跑起来）") + "\n\n"
             "## 问题\n\n"
@@ -2695,11 +3128,11 @@ def cmd_stage(args) -> int:
             encoding="utf-8")
         rep = report_mod.write_report(root, VERSION)
         print(f"\n初稿 -> {doc}")
-        print("把「问题」表按 P0/P1/P2 填完（每条要带文件:行与修复建议），再 gate --stage S4 ...")
+        print("把「问题」表按 P0/P1/P2 填完（每条要带文件:行与修复建议），再 gate --stage S5 ...")
         print(f"报告页面：{rep['path']}")
         return 0
 
-    if stage == "S5":
+    if stage == "S6":
         trace = ""
         if getattr(args, "log", ""):
             spath = _HERE / "stackmap.py"
@@ -2710,10 +3143,10 @@ def cmd_stage(args) -> int:
                 subprocess.run([sys.executable, str(spath), "--root", str(root),
                                 "--log", str(log_path)], capture_output=True,
                                encoding="utf-8", errors="replace", cwd=str(root))
-                trace = read_text(out_dir / "trace.md").strip()
-        doc = out_dir / "S5-fix.md"
+                trace = read_text(out_dir / "调用链映射.md").strip()
+        doc = out_dir / "S6-缺陷定位.md"
         doc.write_text(
-            "# S5 缺陷定位与修复（脚本初稿）\n\n"
+            "# S6 缺陷定位与修复（脚本初稿）\n\n"
             f"- 生成时间：{now()}\n\n"
             "## 现象\n\n（报错原文、堆栈、时间、环境、触发操作、频率）\n\n"
             "## 栈帧映射\n\n" + (_demote_md(trace) or "（用 --log err.log 让脚本自动映射到文件:行）") + "\n\n"
@@ -2722,7 +3155,7 @@ def cmd_stage(args) -> int:
             encoding="utf-8")
         rep = report_mod.write_report(root, VERSION)
         print(f"\n初稿 -> {doc}")
-        print("补完现象、根因、证据链、最小修复，再 gate --stage S5 ...")
+        print("补完现象、根因、证据链、最小修复，再 gate --stage S6 ...")
         print(f"报告页面：{rep['path']}")
         return 0
 
@@ -2736,13 +3169,13 @@ def cmd_next(args) -> int:
     """读状态，直接说下一步做什么，省得每次翻文档。"""
     root = Path(args.root).resolve()
     out_dir = ensure_state_dir(root)
-    state = json.loads(read_text(out_dir / "state.json") or "{}")
+    state = json.loads(read_text(out_dir / "状态.json") or "{}")
     gates = load_gates(root)
-    seq = ["S1", "S2", "S3", "S4", "S5", "S6"]
+    seq = list(GATE_ORDER)
 
-    stage = state.get("stage", "S1")
+    stage = state.get("stage", "S0")
     if stage not in seq:
-        stage = "S1"
+        stage = "S0"
 
     print(f"当前阶段：{stage}  轮次：{state.get('round') or '—'}")
     for st in seq:
@@ -2763,12 +3196,19 @@ def cmd_next(args) -> int:
     print()
     if not g:
         print(f"下一步：产出 {target}（{STAGE_TITLE[target]}）")
-        if target == "S2":
+        if target == "S0":
+            print("  python scripts/devloop.py stage --root . --stage S0")
+            print("  然后用弹窗把四类问题问完，答案填进「问答表」，再 gate --stage S0")
+        elif target == "S2":
             print("  python scripts/devloop.py stage --root . --stage S2 --base HEAD")
+            print("  先写失败测试并留红色输出，再实现到绿；实现完逐条回访确认")
+        elif target == "S3":
+            print("  python scripts/devloop.py stage --root . --stage S3 --base HEAD")
         elif target == "S1":
             print("  python scripts/devloop.py stage --root . --stage S1 --files <锚点文件>")
         else:
-            print(f"  按 SKILL.md 的 {target} 规程做完，写成 .devloop/{STAGE_ANCHOR.get(target, target + '.md')}")
+            print(f"  按 SKILL.md 的 {target} 规程做完，写成 "
+                  f".devloop/{report_mod.STAGE_ANCHOR.get(target, target + '.md')}")
     elif g.get("status") == "pending":
         print(f"下一步：把 {g.get('doc')} 贴给用户看，等明确同意")
         print(f"  报告页面：python scripts/devloop.py report --root .")
@@ -2806,7 +3246,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = sub.add_parser("graph", help="改造清单依赖图")
     g.add_argument("--root", default=".")
-    g.add_argument("--files", default="", help="改造清单文件，逗号分隔；省略则读 impact.json")
+    g.add_argument("--files", default="", help="改造清单文件，逗号分隔；省略则读 影响面.json")
     g.add_argument("--depth", type=int, default=1, help="向下展开层数，1-3，默认 1")
     g.add_argument("--max-nodes", type=int, default=40, help="节点上限，默认 40")
     g.add_argument("--format", choices=["ascii", "mermaid", "both"], default="both",
@@ -2831,7 +3271,7 @@ def build_parser() -> argparse.ArgumentParser:
     au.add_argument("--root", default=".")
     au.add_argument("--base", default="HEAD", help="对比基线，默认 HEAD")
     au.add_argument("--scope", choices=["code", "docs", "all"], default="code",
-                    help="对账范围：code 只对代码项（S2），docs 只对文档项（S3），默认 code")
+                    help="对账范围：code 只对代码项（S3），docs 只对文档项（S4），默认 code")
     au.set_defaults(func=cmd_audit)
 
     b = sub.add_parser("baseline", help="文档基线：记录或复核")
@@ -2853,9 +3293,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = sub.add_parser("gate", help="阶段确认门：登记 / 用户确认 / 标记不适用")
     g.add_argument("--root", default=".")
-    g.add_argument("--stage", default="S1", help="阶段 S1-S6，默认 S1")
+    g.add_argument("--stage", default="S1", help="阶段 S0-S7，默认 S1")
     g.add_argument("--files", default="", help="本阶段清单覆盖的文件，逗号分隔")
-    g.add_argument("--doc", default="", help="本阶段报告文件，默认 .devloop/<阶段>-gate.md")
+    g.add_argument("--doc", default="", help="本阶段报告文件，默认 .devloop/<阶段>-确认单.md")
     g.add_argument("--summary", default="", help="一句话说明")
     g.add_argument("--approve", action="store_true", help="用户确认后标记为已确认")
     g.add_argument("--revise", action="store_true",
@@ -2864,6 +3304,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--note", default="", help="用户原话，确认或跳过时必填")
     g.add_argument("--show", action="store_true", help="查看各阶段确认状态")
     g.set_defaults(func=cmd_gate)
+
+    ckd = sub.add_parser("check", help="只校验阶段报告是否达标，不登记（改稿时反复用）")
+    ckd.add_argument("--root", default=".")
+    ckd.add_argument("--stage", required=True, help="阶段 S0-S7")
+    ckd.add_argument("--doc", default="", help="报告路径，默认 .devloop/<阶段默认报告>")
+    ckd.set_defaults(func=cmd_check)
 
     ck = sub.add_parser("check-commit", help="供 commit-msg hook 调用：校验提交清单")
     ck.add_argument("--root", default=".")
@@ -2896,17 +3342,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     rp = sub.add_parser("report", help="把各阶段报告渲染成单文件 HTML")
     rp.add_argument("--root", default=".")
-    rp.add_argument("--name", default="report.html", help="输出文件名，默认 report.html")
+    rp.add_argument("--name", default="看板.html", help="输出文件名，默认 看板.html")
     rp.add_argument("--history", action="store_true", help="列出历史报告，不重新生成")
     rp.set_defaults(func=cmd_report)
 
     sg = sub.add_parser("stage", help="一条命令跑完某阶段的分析、报告与登记")
     sg.add_argument("--root", default=".")
-    sg.add_argument("--stage", default="S2", help="S1-S5，默认 S2")
+    sg.add_argument("--stage", default="S3", help="S0-S7，默认 S3")
     sg.add_argument("--base", default="HEAD", help="对比基线，默认 HEAD")
     sg.add_argument("--files", default="", help="限定文件，逗号分隔")
     sg.add_argument("--summary", default="", help="一句话说明")
-    sg.add_argument("--log", default="", help="S5 用：报错日志文件，自动映射到文件:行")
+    sg.add_argument("--log", default="", help="S6 用：报错日志文件，自动映射到文件:行")
     sg.set_defaults(func=cmd_stage)
 
     nx = sub.add_parser("next", help="看下一步该做什么")
@@ -2915,7 +3361,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("state", help="阶段状态")
     st.add_argument("--root", default=".")
-    st.add_argument("--set", default="", help="设置当前阶段，如 S1/S2/S3/S4/S5")
+    st.add_argument("--set", default="", help="设置当前阶段，如 S1/S3/S4/S5/S6")
     st.add_argument("--note", default="")
     st.add_argument("--round", default="", help="开新一轮需求：归档旧清单、重置到 S1")
     st.add_argument("--add", default="", help="新增未闭环项")
