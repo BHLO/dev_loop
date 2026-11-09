@@ -42,9 +42,10 @@ if str(_HERE) not in sys.path:
 
 import astindex  # noqa: E402  符号索引与盲区检测
 import quality as quality_mod  # noqa: E402  实现质量扫描
-import report as report_mod  # noqa: E402  Markdown → HTML 报告
+import report as report_mod
+import diagram as diagram_mod  # noqa: E402  Markdown → HTML 报告
 
-VERSION = "1.12.0"
+VERSION = "1.14.0"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -2035,6 +2036,50 @@ def check_tdd(text: str) -> list[str]:
     return problems
 
 
+# 「继续」「好的」「嗯」这类不是对方案的确认，只是让人往下走。
+# 用户中断后回来说一句「继续」，agent 拿它当批准直接进下一阶段——这是本项目
+# 真实踩过的坑（S1 方案没再看一眼就进了 S2，看板还停在待确认）。
+# 只拦「让人往下走」这类话，不拦真正的回答：
+# 「可以」是在回答「按 B 方案、改 3 个文件，可以吗？」，算确认；
+# 「继续」不是——它只说明用户想往前走，没说明他看过报告。
+LOW_INFO_NOTES = {
+    "继续", "继续吧", "继续做", "继续执行", "继续推进", "接着", "接着做", "接着干",
+    "往下", "往下走", "下一步", "下一步吧", "走下去", "go", "next", "continue", "resume",
+    "嗯", "嗯嗯", "唔", "呃",
+}
+
+
+def note_is_thin(note: str) -> bool:
+    """这条「用户原话」是不是只够表示「往下走」，不足以表示「我看过这份方案」。"""
+    s = re.sub(r"[\s。，,！!~～.、]", "", note or "").lower()
+    return (not s) or s in LOW_INFO_NOTES
+
+
+def refresh_reports(root: Path, stage: str | None = None) -> dict:
+    """看板 + 单阶段视图一起重渲染。
+
+    阶段状态一变（登记/确认/跳过/退回/切阶段），页面必须跟着变——
+    否则用户看到的是「待确认」，实际早就批准了，或者反过来。
+    """
+    out = {"full": None, "focused": None}
+    if not (root / STATE_DIR).is_dir():
+        return out
+    try:
+        out["full"] = report_mod.write_report(root, VERSION)["path"]
+        if stage:
+            out["focused"] = report_mod.write_report(root, VERSION, focus=stage)["path"]
+    except OSError as exc:
+        # 页面刷新失败不能静默：用户正看着旧状态，得让他知道
+        print(f"  [警告] 看板刷新失败：{exc}")
+        print("  页面可能还停在旧状态，手动跑一次 report --root . 重试")
+    return out
+
+
+def stage_view(root: Path, stage: str) -> Path:
+    """单阶段视图的路径（还没生成也给出预期路径，方便先告诉用户）。"""
+    return root / STATE_DIR / f"看板-{stage}.html"
+
+
 def load_gates(root: Path) -> dict:
     """读确认记录；旧版本（S1..S6）的键自动后移一位，避免被当成新阶段的记录。"""
     p = gates_path(root)
@@ -2163,10 +2208,13 @@ def cmd_gate(args) -> int:
         gates[stage] = {"at": now(), "status": "skipped", "summary": args.summary or "",
                         "files": [], "doc": "", "signature": "", "note": args.note.strip()}
         write_gates(root, gates)
+        rep = refresh_reports(root, stage)
         nxt = GATE_ORDER[GATE_ORDER.index(stage) + 1] if stage != GATE_ORDER[-1] else None
         print(f"{stage}（{STAGE_TITLE[stage]}）标记为不适用"
               + (f"——可以进入 {nxt}。" if nxt else "——流程结束。"))
         print(f"  用户原话：{args.note.strip()}")
+        if rep["full"]:
+            print(f"  看板已更新：{rep['full']}")
         return 0
 
     if args.approve or do_skip:
@@ -2187,6 +2235,17 @@ def cmd_gate(args) -> int:
             print(f"{'--approve' if args.approve else '--skip'} 必须带 --note：写用户的原话，"
                   f"例如 \"可以，按这个来\" 或 \"这次不涉及文档\"。")
             return 2
+        # 「继续」不是确认。会话中断后回来说一句「继续」，如果直接记成批准，
+        # 就等于用户没看报告也进了下一阶段——必须先重放报告、问到一句有内容的话。
+        if note_is_thin(args.note):
+            print(f"{stage}（{STAGE_TITLE[stage]}）没有真正确认：「{args.note.strip()}」"
+                  f"只表示往下走，不表示看过这份报告。")
+            print(f"  1) 重新打开 {stage_view(root, stage)}（或用 present_files 打开看板）")
+            print(f"  2) 复述这份报告的关键结论 3 条，指出要用户拍板的地方")
+            print(f"  3) 问一句具体的，例如「按 B 方案、改 3 个文件，可以吗？」")
+            print(f"  4) 把用户对这句话的答复原样写进 --note，再确认")
+            print(f"  阶段仍然是待确认状态，没有推进。")
+            return 4
 
         doc = root / g["doc"] if g.get("doc") else None
         now_sig = gate_sig(g.get("files", []), doc)
@@ -2201,15 +2260,21 @@ def cmd_gate(args) -> int:
         g["note"] = args.note.strip()
         gates[stage] = g
         write_gates(root, gates)
+        rep = refresh_reports(root, stage)
 
         nxt = GATE_ORDER[GATE_ORDER.index(stage) + 1] if stage != GATE_ORDER[-1] else None
+        rev = g.get("revision") or 1
         if args.approve:
-            print(f"{stage}（{STAGE_TITLE[stage]}）已确认"
+            print(f"{stage}（{STAGE_TITLE[stage]}）已确认（第 {rev} 版报告）"
                   + (f"——可以进入 {nxt}。" if nxt else "——流程结束。"))
         else:
             print(f"{stage}（{STAGE_TITLE[stage]}）已标记为不适用"
                   + (f"——可以进入 {nxt}。" if nxt else "。"))
         print(f"  用户原话：{args.note.strip()}")
+        if rep["full"]:
+            print(f"  看板已更新：{rep['full']}")
+        if nxt:
+            print(f"  下一阶段给用户看的是：{stage_view(root, nxt)}（切过去时自动生成）")
         return 0
 
     # ---------------- 登记待确认
@@ -2314,14 +2379,22 @@ def cmd_gate(args) -> int:
            f"6. 然后才能 `state --set {GATE_ORDER[min(GATE_ORDER.index(stage) + 1, 5)]}`", ""]
     (out_dir / f"{stage}-确认单.md").write_text("\n".join(md), encoding="utf-8")
 
+    # 报告里的 mermaid 顺手画成一张独立 SVG：.md 在编辑器里只是一段代码，
+    # 用户想要「一张图」的时候可以直接打开它
+    svg = diagram_mod.from_markdown(text)
+    if svg:
+        (out_dir / f"{stage}-架构图.svg").write_text(svg, encoding="utf-8")
+
     tag = f"第 {rev} 版" + (f"，改动 {len([d for d in diff_lines if d.startswith(('+', '-'))])} 行" if diff_lines else "")
     print(f"{stage} 已登记待确认 -> {out_dir / f'{stage}-确认单.md'}（{len(files)} 个文件，{tag}）")
 
-    # 登记即出页面：少一条命令，也保证「贴给用户的东西」一定存在
+    # 登记即出页面：整本 + 本阶段单页，贴给用户的东西一定存在
     try:
         rep = report_mod.write_report(root, VERSION)
+        view = report_mod.write_report(root, VERSION, focus=stage)
         print(f"  报告页面（第 {rep['seq']} 版）：{rep['path']}")
-        print("  用 present_files 打开它——用户看页面，不看 Markdown 源码。")
+        print(f"  本阶段页（打开就定位到 {stage}）：{view['path']}")
+        print("  用 present_files 打开**本阶段页**——用户看页面，不翻整本、不看 Markdown 源码。")
     except OSError as exc:
         print(f"  报告页面生成失败（{exc}），稍后手动跑 report")
     if revisions:
@@ -2649,6 +2722,7 @@ def cmd_state(args) -> int:
         for name in list(DEFAULT_DOC.values()) + [
                 "S7-提交清单.json", "验证报告.md", "确认状态.md", "敏感文件预检.md",
                 "代码对账.md", "文档对账.md", "依赖图.md", "影响面.md",
+                "S1-架构图.svg", "S2-架构图.svg",
                 "文档漂移.md", "文档基线.json", "基线复核.md"]:
             f = out_dir / name
             if f.exists():
@@ -2674,6 +2748,11 @@ def cmd_state(args) -> int:
             state["open_items"][args.close]["done"] = True
     state["updated_at"] = now()
     write_json(path, state)
+
+    # 阶段一变，看板顶部的「当前阶段」和阶段卡片都得跟着变；
+    # 断线重连后用户第一眼看的就是这页，不能停在上一个状态
+    if args.set or args.round:
+        refresh_reports(root, None)
 
     if args.show or not (args.set or args.add or args.close is not None
                          or args.note or args.round):
@@ -2803,7 +2882,15 @@ def cmd_report(args) -> int:
         print("\n  用 present_files 打开任意一份即可对比当时的内容。")
         return 0
 
-    res = report_mod.write_report(root, VERSION, args.name)
+    focus = (args.focus or "").upper() or None
+    if focus and focus not in GATE_ORDER:
+        print(f"未知阶段 {focus}，可选：{'、'.join(GATE_ORDER)}")
+        return 2
+    res = report_mod.write_report(root, VERSION, args.name, focus=focus)
+    if focus:
+        print(f"{focus} 单阶段视图 -> {res['path']}（{res['count']} 份报告）")
+        print("  这一步就是「定位到相关部分」：打开即是该阶段正文，不用翻整本。")
+        return 0
     print(f"报告 -> {res['path']}（{res['count']} 份报告，第 {res['seq']} 版）")
     print(f"  历史 -> {res['snapshot']}（保留最近 {report_mod.KEEP_HISTORY} 份"
           + (f"，已清理 {res['pruned']} 份旧版" if res["pruned"] else "") + "）")
@@ -3210,11 +3297,18 @@ def cmd_next(args) -> int:
             print(f"  按 SKILL.md 的 {target} 规程做完，写成 "
                   f".devloop/{report_mod.STAGE_ANCHOR.get(target, target + '.md')}")
     elif g.get("status") == "pending":
-        print(f"下一步：把 {g.get('doc')} 贴给用户看，等明确同意")
-        print(f"  报告页面：python scripts/devloop.py report --root .")
-        print(f"  同意后：gate --stage {target} --approve --note \"<用户原话>\"")
+        view = stage_view(root, target)
+        print(f"下一步：{target}（{STAGE_TITLE[target]}）在等用户确认——**不要往下走**。")
+        print(f"  重新打开：{view}")
+        print(f"    用 present_files 打开这一页（单阶段视图，直接定位到 {target}）")
+        print(f"    再复述 3 条关键结论，问一句具体的话让他拍板")
+        print(f"  同意后：gate --stage {target} --approve --note \"<用户对这句话的答复>\"")
         if nxt:
             print(f"  然后：state --set {nxt}")
+        print("  注意：「继续」「好的」「嗯」不算确认，gate 会拒收（返回 4），"
+              "阶段不会推进。")
+        if target == "S1":
+            print("  断线重连后尤其如此：先重放报告，再谈下一步。")
     else:
         print(f"{target} 状态异常（{g.get('status')}），重新登记一次。")
     return 0
@@ -3342,8 +3436,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     rp = sub.add_parser("report", help="把各阶段报告渲染成单文件 HTML")
     rp.add_argument("--root", default=".")
-    rp.add_argument("--name", default="看板.html", help="输出文件名，默认 看板.html")
+    rp.add_argument("--name", default="",
+                    help="输出文件名；默认 看板.html，--focus 时默认 看板-<阶段>.html")
     rp.add_argument("--history", action="store_true", help="列出历史报告，不重新生成")
+    rp.add_argument("--focus", default="", help="只渲染某个阶段（S0-S7），生成单阶段视图")
     rp.set_defaults(func=cmd_report)
 
     sg = sub.add_parser("stage", help="一条命令跑完某阶段的分析、报告与登记")

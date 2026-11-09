@@ -463,3 +463,25 @@ S1 报告不达要求，不予登记：
 
 要点：**先给方案对比，再给清单，最后给风险与约束**。不要一上来就贴文件列表——
 用户没法判断「该不该这么改」，只能判断「改得全不全」。
+
+## 架构图：支持哪些 mermaid 写法
+
+`gate` 登记时会把报告里第一段能画的 mermaid 渲染成 SVG（页面内联 + `.devloop/S1-架构图.svg`），
+渲染器是 `scripts/diagram.py`，纯标准库、不联网。支持范围：
+
+| 写法 | 例子 |
+|---|---|
+| 方向 | `flowchart LR` / `flowchart TB` / `graph TD`（LR/RL/TB/BT） |
+| 矩形 | `A["控制器"]` |
+| 圆角 | `A("控制器")` |
+| 判断 | `A{"鉴权"}` |
+| 库 | `A[("orders")]` |
+| 圆 | `A(("起点"))` |
+| 实线箭头 | `A --> B` |
+| 边标签 | `A -->\|"调用"\| B` |
+| 虚线 | `A -.-> B` |
+| 粗线 | `A ==> B` |
+| 着色 | `classDef target fill:#DBEAFE,stroke:#2563EB,color:#1E3A8A` + `class A,B target` |
+
+不支持 `sequenceDiagram` / `classDiagram` / 多层 `subgraph` 语义：遇到这些会退回代码块并注明，
+不会画错。写图时按上表来，别用 `subgraph` 套复杂布局。

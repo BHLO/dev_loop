@@ -16,6 +16,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+import diagram
+
 STAGE_TITLE = {
     "S0": "需求澄清",
     "S1": "需求影响面与技术方案",
@@ -98,7 +100,18 @@ def md_to_html(text: str) -> str:
             i += 1
             code = "\n".join(buf)
             if lang == "mermaid":
-                out.append(f'<pre class="mermaid">{html.escape(code)}</pre>')
+                # 本地画成 SVG：不依赖 CDN，离线/内网也能看到图。
+                # 画不出来的语法（时序图等）退回代码块，并说明原因。
+                svg = diagram.to_svg(code)
+                if svg:
+                    out.append(f'<figure class="diagram">{svg}'
+                               f'<details><summary>mermaid 源码</summary>'
+                               f'<pre class="code"><code>{html.escape(code)}</code></pre>'
+                               f'</details></figure>')
+                else:
+                    out.append('<p class="empty">这段图不是 flowchart，暂不能本地渲染，'
+                               '下面保留源码。</p>'
+                               f'<pre class="code"><code>{html.escape(code)}</code></pre>')
             else:
                 out.append(f'<pre class="code"><code>{html.escape(code)}</code></pre>')
             continue
@@ -231,8 +244,17 @@ font-family:"Cascadia Mono",Consolas,monospace}
 pre.code{background:#0f172a;color:#e2e8f0;padding:14px 16px;border-radius:8px;
 overflow:auto;font-size:13px;line-height:1.6}
 pre.code code{background:none;color:inherit;padding:0}
-pre.mermaid{background:var(--code);padding:14px;border-radius:8px;overflow:auto;
+.nav{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:14px 0;
 font-size:13px;color:var(--muted)}
+.nav a{color:var(--accent);text-decoration:none;padding:3px 9px;border-radius:6px;
+background:#eff6ff;border:1px solid #bfdbfe}
+.nav a:hover{background:#dbeafe}
+figure.diagram{margin:14px 0;padding:14px;background:#fff;border:1px solid var(--line);
+border-radius:10px;overflow:auto}
+figure.diagram svg{display:block;margin:0 auto}
+figure.diagram details{margin-top:8px}
+figure.diagram summary{cursor:pointer;color:var(--muted);font-size:12px}
+figure.diagram pre.code{margin-top:8px}
 .table-wrap{overflow-x:auto;margin:12px 0}
 table{border-collapse:collapse;width:100%;font-size:14px}
 th,td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
@@ -248,15 +270,6 @@ a{color:var(--accent)}
 footer{color:var(--muted);font-size:12px;text-align:center;margin-top:32px}
 """
 
-MERMAID_SCRIPT = """
-<script type="module">
-try {
-  const m = await import('https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs');
-  m.default.initialize({startOnLoad:true, theme:'neutral'});
-} catch (e) { /* 离线时保留源码，不白屏 */ }
-</script>
-"""
-
 
 def _load_json(path: Path) -> dict:
     if not path.exists():
@@ -267,9 +280,11 @@ def _load_json(path: Path) -> dict:
         return {}
 
 
-def _gate_cards(gates: dict) -> str:
+def _gate_cards(gates: dict, focus: str | None = None) -> str:
     cards = []
     for st in STAGE_ANCHOR:
+        if focus and st != focus:
+            continue
         g = gates.get(st) or {}
         status = g.get("status", "")
         cls = {"approved": "ok", "pending": "warn", "skipped": "gray"}.get(status, "gray")
@@ -304,8 +319,13 @@ def _stats_strip(quality_data: dict, gates: dict, state: dict) -> str:
 
 
 def build_html(root: Path, version: str, title: str = "研发闭环 · 报告看板",
-               seq: int = 0, prev_href: str = "") -> tuple[str, int]:
-    """返回 (html, 渲染了几份报告)。"""
+               seq: int = 0, prev_href: str = "",
+               focus: str | None = None) -> tuple[str, int]:
+    """返回 (html, 渲染了几份报告)。
+
+    ``focus`` 给定阶段号（S0…S7）时只渲染那一阶段的报告，生成「单阶段视图」——
+    每个阶段收尾时给用户看的是这一页，不用在整本看板里翻。
+    """
     out_dir = root / ".devloop"
     gates = _load_json(out_dir / "确认记录.json")
     state = _load_json(out_dir / "状态.json")
@@ -317,6 +337,8 @@ def build_html(root: Path, version: str, title: str = "研发闭环 · 报告看
 
     sections, count = [], 0
     for st, name in REPORT_ORDER:
+        if focus and st != focus:
+            continue
         f = out_dir / name
         if not f.exists():
             continue
@@ -325,8 +347,9 @@ def build_html(root: Path, version: str, title: str = "研发闭环 · 报告看
             continue
         count += 1
         heading = f"{st} · {STAGE_TITLE[st]}" if st else FILE_TITLE.get(name, name)
+        anchor = f"stage-{st}" if st else f"file-{name}"
         sections.append(
-            f'<section class="card"><h2>{html.escape(heading)}</h2>'
+            f'<section class="card" id="{anchor}"><h2>{html.escape(heading)}</h2>'
             f'<div class="src">.devloop/{html.escape(name)}</div>'
             f"{md_to_html(text)}</section>")
 
@@ -337,6 +360,15 @@ def build_html(root: Path, version: str, title: str = "研发闭环 · 报告看
     seq_html = f"<span>第 {seq} 版</span>" if seq else ""
     prev_html = (f'<span><a href="{html.escape(prev_href)}">← 上一版</a></span>'
                  if prev_href else "")
+
+    if focus:
+        title = f"{focus} · {STAGE_TITLE.get(focus, focus)}"
+        nav = (f'<div class="nav"><a href="看板.html">← 看整本看板</a>'
+               f'<span>本页只含 {focus} 阶段的报告</span></div>')
+    else:
+        links = "".join(f'<a href="#stage-{st}">{st} {STAGE_TITLE[st]}</a>'
+                        for st in STAGE_ANCHOR)
+        nav = f'<div class="nav"><span>跳到阶段：</span>{links}</div>' if sections else ""
 
     body = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -354,11 +386,12 @@ def build_html(root: Path, version: str, title: str = "研发闭环 · 报告看
     {prev_html}
   </div>
 </header>
-{_gate_cards(gates)}
+{_gate_cards(gates, focus)}
 {_stats_strip(quality_data, gates, state)}
+{nav}
 {''.join(sections)}
 <footer>由 dev-loop 生成 · 报告只读，改动请在 .devloop/ 下的 Markdown 里做</footer>
-</div>{MERMAID_SCRIPT}</body></html>"""
+</div></body></html>"""
     return body, count
 
 
@@ -370,15 +403,26 @@ def _history_files(out_dir: Path) -> list[Path]:
     return sorted((out_dir / HISTORY_DIR).glob("看板-*.html"))
 
 
-def write_report(root: Path, version: str, name: str = "看板.html",
-                 keep: int = KEEP_HISTORY) -> dict:
+def write_report(root: Path, version: str, name: str = "",
+                 keep: int = KEEP_HISTORY, focus: str | None = None) -> dict:
     """渲染看板，同时留一份历史快照。
 
     覆盖式的 看板.html 只回答「现在什么样」，回答不了「上周批的是什么」。
     历史按时间戳命名，保留最近 keep 份。
+
+    ``focus="S1"`` 生成单阶段视图（默认 `看板-S1.html`）：每个阶段收尾给用户看的
+    就是这一页，不用在整本看板里翻；视图不写历史快照，它只是一页投影。
     """
     out_dir = root / ".devloop"
     out_dir.mkdir(parents=True, exist_ok=True)
+    if focus:
+        target = out_dir / (name or f"看板-{focus}.html")
+        html_text, count = build_html(root, version, focus=focus)
+        target.write_text(html_text, encoding="utf-8")
+        return {"path": target, "count": count, "snapshot": None, "seq": 0,
+                "pruned": 0, "history": []}
+
+    name = name or "看板.html"
     hist_dir = out_dir / HISTORY_DIR
     hist_dir.mkdir(parents=True, exist_ok=True)
 
