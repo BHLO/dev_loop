@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -45,7 +46,7 @@ import quality as quality_mod  # noqa: E402  实现质量扫描
 import report as report_mod
 import diagram as diagram_mod  # noqa: E402  Markdown → HTML 报告
 
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -1769,6 +1770,9 @@ def cmd_audit(args) -> int:
     if extra:
         for p in extra:
             flag = "（新增文件）" if changed[p] == "A" else ""
+            if _is_test_file(p):
+                # 测试是 S2 才写的，S1 清单本来就不含它：提醒确认，不判错
+                flag += "（S2 新增测试：属预期，确认后标 SKIPPED 即可）"
             md.append(f"- `{p}` {flag}")
     else:
         md.append("无")
@@ -1894,6 +1898,58 @@ def count_items(body: str) -> int:
             n += 1
         i += 1
     return n
+
+
+# 前端 / 后端文件：只有两边同时改，才需要先在 S1 定「接口契约」
+FRONT_EXTS = {".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte", ".css", ".scss", ".less"}
+BACK_EXTS = {".java", ".kt", ".py", ".go", ".cs", ".php", ".rb", ".rs", ".scala"}
+
+RECEIPT_DIR = "回执"
+
+
+def needs_contract(files: list[str]) -> bool:
+    """这次改动是不是跨端（前端 + 后端都有）。"""
+    front = any(Path(f).suffix.lower() in FRONT_EXTS for f in files)
+    back = any(Path(f).suffix.lower() in BACK_EXTS for f in files)
+    return front and back
+
+
+def check_contract(text: str) -> list[str]:
+    """跨端改动必须在 S1 写清接口长什么样。
+
+    符号检查跨不了语言：前端 `refundApi` 和后端 `create_refund` 之间没有任何
+    可被脚本看到的引用，但它们在说同一个接口。不先在方案里把参数名、必填性、
+    返回结构定下来，两边各改各的，合并时就是接口对不上。
+    """
+    body = section_body(text, ("接口契约", "接口约定", "契约"))
+    if not body.strip() or count_items(body) < 1:
+        return ["接口契约（前后端同时改，必须写清接口：路径 / 方法 / 参数名与必填性 / 返回）"]
+    return []
+
+
+def receipt_path(root: Path, lane_name: str) -> Path:
+    return root / STATE_DIR / RECEIPT_DIR / f"{lane_name}.md"
+
+
+def check_receipts(root: Path, plan: dict) -> list[str]:
+    """并行时每条车道都要交自检回执。
+
+    脚本看不到子代理跑过什么，但能看到它有没有把「命令 / 红 / 绿」交上来。
+    没有回执，就等于「我没验，但我说好了」——这种不能过 S2 门。
+    """
+    if not plan.get("parallel"):
+        return []
+    problems: list[str] = []
+    for item in plan.get("dispatch") or []:
+        f = receipt_path(root, item["name"])
+        if not f.exists():
+            problems.append(f"{item['name']} 没交自检回执（{STATE_DIR}/{RECEIPT_DIR}/"
+                            f"{item['name']}.md）——子代理自测过没有，没有任何证据")
+            continue
+        body = read_text(f)
+        if not any(k in body for k in ("红", "失败")) or not any(k in body for k in ("绿", "通过")):
+            problems.append(f"{item['name']} 的回执缺红/绿证据（要写命令、失败输出、通过输出）")
+    return problems
 
 
 def check_doc_sections(stage: str, text: str) -> list[str]:
@@ -2075,6 +2131,240 @@ def refresh_reports(root: Path, stage: str | None = None) -> dict:
     return out
 
 
+PROJECT_INDEX = Path.home() / ".workbuddy" / "dev-loop" / "项目索引.json"
+
+
+def _index_file() -> Path:
+    override = os.environ.get("DEVLOOP_INDEX_FILE")
+    return Path(override) if override else PROJECT_INDEX
+
+
+def _is_temp(root: Path) -> bool:
+    try:
+        root.resolve().relative_to(Path(tempfile.gettempdir()).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _index_read() -> dict:
+    """读全局索引；顺手清掉已经不存在的项目（临时目录、删掉的仓库）。"""
+    path = _index_file()
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    alive = {k: v for k, v in raw.items() if Path(k).is_dir()}
+    return alive
+
+
+def index_upsert(root: Path, extra: dict | None = None) -> None:
+    """把本项目写进全局索引——换个会话、换个目录，也能认出「哪个项目走到哪」。
+
+    索引只存路径与本轮状态，不含任何代码内容；读的时候会剔除已不存在的目录，
+    所以临时仓库不会长期堆在里面。
+    """
+    if not os.environ.get("DEVLOOP_INDEX_FILE") and _is_temp(root):
+        return                      # 临时仓库不进索引：跑测试不该污染真实项目列表
+    try:
+        data = _index_read()
+        state_file = root / STATE_DIR / "状态.json"
+        state = {}
+        if state_file.exists():
+            try:
+                state = json.loads(state_file.read_text(encoding="utf-8"))
+            except Exception:
+                state = {}
+        gates = stage_gates(load_gates(root))
+        entry = {
+            "name": root.name,
+            "round": state.get("round", ""),
+            "stage": current_stage(state, gates),
+            "gates": {k: v.get("status") for k, v in gates.items()},
+            "updated_at": now(),
+            "seq": time.time_ns(),      # 同一秒内也要能排出先后（updated_at 只到秒）
+        }
+        if extra:
+            entry.update(extra)
+        data[str(root)] = entry
+        # 只留最近 50 个，按更新时间倒序
+        items = sorted(data.items(), key=lambda kv: kv[1].get("seq", 0), reverse=True)
+        target = _index_file()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(dict(items[:50]), ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"  [警告] 项目索引写入失败：{exc}（不影响本项目的状态）")
+
+
+def current_stage(state: dict, gates: dict) -> str:
+    """当前该在哪一阶段：state.stage 已确认/已跳过时，按门禁推到第一个没完成的。
+
+    `gate` 不会自动改 state.stage（那是 `state --set` 的事），
+    所以只看 state 会停在很早的阶段，resume 就会说「当前 S0、下一步 S7」。
+    """
+    stage = state.get("stage") or "S0"
+    nxt = next((st for st in GATE_ORDER
+                if (gates.get(st) or {}).get("status") not in ("approved", "skipped")), None)
+    if nxt and (stage not in GATE_ORDER
+                or (gates.get(stage) or {}).get("status") in ("approved", "skipped")):
+        return nxt
+    return stage
+
+
+def project_brief(root: Path) -> dict:
+    """一个项目的「我在哪」摘要：名字、轮次、阶段、各门禁、在等什么。"""
+    state_file = root / STATE_DIR / "状态.json"
+    state = {}
+    if state_file.exists():
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
+    gates = stage_gates(load_gates(root))
+    stage = current_stage(state, gates)
+    pending = next((st for st in GATE_ORDER
+                    if (gates.get(st) or {}).get("status") == "pending"), None)
+    nxt = next((st for st in GATE_ORDER
+                if (gates.get(st) or {}).get("status") not in ("approved", "skipped")), None)
+    return {"root": root, "name": root.name, "round": state.get("round", ""),
+            "stage": stage, "pending": pending, "next": nxt, "gates": gates,
+            "updated_at": state.get("updated_at", "")}
+
+
+def _project_root_from(start: Path) -> Path | None:
+    """从当前目录往上找最近的「跑过本技能」的目录。
+
+    在 repo/src/api 里跑，也要认出 repo——所以不是只看当前目录。
+    """
+    cur = start.resolve()
+    for _ in range(40):
+        if (cur / STATE_DIR / "状态.json").exists():
+            return cur
+        if cur.parent == cur:
+            return None
+        cur = cur.parent
+    return None
+
+
+def _resolve_project(arg: str) -> tuple[Path | None, str]:
+    """把 --root 的输入解析成项目根，返回 (root, 依据)。
+
+    先当路径找（相对、绝对都试），找不到再拿索引里的项目名匹配。
+    名字对上多个时**不猜**——猜错项目比报错更糟，直接把候选列出来。
+    """
+    p = Path(arg).expanduser()
+    for cand in (p, Path.cwd() / p):
+        try:
+            c = cand.resolve()
+        except OSError:
+            continue
+        if (c / STATE_DIR).is_dir():
+            return c, f"路径 {c}"
+
+    name = (p.name or arg).strip()
+    if not name:
+        return None, ""
+    data = _index_read()
+    low = name.lower()
+    hits = [(r, e) for r, e in data.items() if (e.get("name") or "").lower() == low]
+    if not hits:
+        hits = [(r, e) for r, e in data.items() if low in (e.get("name") or "").lower()]
+    if len(hits) == 1:
+        r = Path(hits[0][0])
+        return r, f"按项目名「{name}」命中索引：{r}"
+    if len(hits) > 1:
+        lines = [f"「{name}」在索引里对上 {len(hits)} 个项目，不猜："]
+        for r, e in hits:
+            lines.append(f"  - {e.get('name')}  {r}  轮次：{e.get('round') or '—'}")
+        lines.append('  用完整路径重跑：resume --root "<路径>"')
+        return None, "\n".join(lines)
+    return None, ""
+
+
+def _print_project_detail(root: Path, why: str) -> int:
+    b = project_brief(root)
+    index_upsert(root)
+    print(f"项目：{b['name']}（{b['root']}）")
+    if why:
+        print(f"识别依据：{why}")
+    print(f"轮次：{b['round'] or '（未命名，建议 state --round \"<需求>\"）'}")
+    print(f"当前阶段：{b['stage']}")
+    marks = {"approved": "✓", "pending": "…", "skipped": "-"}
+    line = "  ".join(f"{marks.get((b['gates'].get(st) or {}).get('status'), '·')}{st}"
+                     for st in GATE_ORDER)
+    print(f"门禁：{line}")
+    if b["pending"]:
+        print(f"\n停在这里：{b['pending']}（{STAGE_TITLE[b['pending']]}）等你确认。")
+        print(f"  重新打开：{stage_view(root, b['pending'])}")
+        print("  不要往下走：先重放报告、复述 3 条结论、问一句具体的，再记录答复。")
+        print(f"  同意后：gate --stage {b['pending']} --approve --note \"<用户对这句话的答复>\"")
+    elif b["next"]:
+        print(f"\n下一步：产出 {b['next']}（{STAGE_TITLE[b['next']]}）")
+        if b["next"] in ("S0", "S2"):
+            print(f"  python scripts/devloop.py stage --root . --stage {b['next']}")
+    else:
+        print("\n所有阶段都已确认，可以出提交清单：commit --root . --message \"...\"")
+    return 0
+
+
+def cmd_resume(args) -> int:
+    """跨会话续跑：先认出「哪个项目、走到哪」，再给下一步。"""
+    root: Path | None = None
+    why = ""
+
+    if args.root:
+        root, why = _resolve_project(args.root)
+        if root is None:
+            if why:
+                print(why)
+                return 2
+            print(f"{Path(args.root).resolve()} 下没有 .devloop/，这个项目还没跑过本技能，"
+                  "也没有同名记录。")
+            print("  新项目：state --root . --round \"<需求一句话>\"")
+            print("  看已记录的项目：resume --all")
+            return 2
+    elif not getattr(args, "all", False):
+        # 没给 --root 时，先认当前目录：向上找到 .devloop 就是它，
+        # 不用你从列表里挑，也不会挑错
+        found = _project_root_from(Path.cwd())
+        if found:
+            root = found
+            why = f"当前目录向上找到 {found / STATE_DIR / '状态.json'}"
+
+    if root is not None:
+        rc = _print_project_detail(root, why)
+        others = [r for r in _index_read() if Path(r).resolve() != root.resolve()]
+        if others:
+            print(f"\n另有 {len(others)} 个进行中的项目：resume --all")
+        return rc
+
+    data = _index_read()
+    if not data:
+        print("没有记录过任何项目。在项目里跑一次 `state --root .` 或 `gate` 就会记下来。")
+        return 0
+    items = sorted(data.items(), key=lambda kv: kv[1].get("seq", 0), reverse=True)
+    names = [e.get("name", Path(r).name) for r, e in items]
+    dup = {n for n in names if names.count(n) > 1}
+    print(f"进行中的项目（{len(items)} 个，按最近更新排序）：")
+    if dup:
+        print(f"  注意：{('、'.join(sorted(dup)))} 有同名项目，**按路径区分**，别按名字挑。")
+    for i, (r, e) in enumerate(items, 1):
+        gates = e.get("gates") or {}
+        done = sum(1 for v in gates.values() if v in ("approved", "skipped"))
+        flag = "✅已收尾" if gates.get("S7") in ("approved", "skipped") else "进行中"
+        print(f"  {i}. {e.get('name', Path(r).name)}  [{flag}]  "
+              f"{e.get('stage', '—')}  门禁 {done}/{len(GATE_ORDER)}  "
+              f"{e.get('updated_at', '')}")
+        print(f"     轮次：{e.get('round') or '—'}")
+        print(f"     路径：{r}")
+        print(f"     续跑：python scripts/devloop.py resume --root \"{r}\"")
+    print("\n进入项目目录直接跑 `resume`，会自动认当前项目；也可以带上面那条完整路径。")
+    return 0
+
+
 def stage_view(root: Path, stage: str) -> Path:
     """单阶段视图的路径（还没生成也给出预期路径，方便先告诉用户）。"""
     return root / STATE_DIR / f"看板-{stage}.html"
@@ -2096,6 +2386,7 @@ def write_gates(root: Path, gates: dict) -> None:
     """写确认记录，顺手打上 schema 标记——没有标记的都被当成 1.10 的旧格式。"""
     gates["_schema"] = GATE_SCHEMA
     write_json(gates_path(root), gates)
+    index_upsert(root)
 
 
 def stage_gates(gates: dict) -> dict:
@@ -2297,8 +2588,18 @@ def cmd_gate(args) -> int:
     # S0 与 S2 光有小节不够：一个要真问过并拿到答案，一个要真走过红绿
     if stage == "S0":
         missing += check_clarify(text)
+    elif stage == "S1" and needs_contract(files):
+        # 跨端改动：方案里没定接口，就等于让两边各猜一遍
+        missing += check_contract(text)
     elif stage == "S2":
         missing += check_tdd(text)
+        plan_file = root / STATE_DIR / "S2-并行方案.json"
+        if plan_file.exists():
+            try:
+                plan = json.loads(plan_file.read_text(encoding="utf-8"))
+            except Exception:
+                plan = {}
+            missing += check_receipts(root, plan)
     if missing:
         print(f"{stage} 报告不达要求，不予登记：")
         for item in missing:
@@ -2644,6 +2945,525 @@ def cmd_check(args) -> int:
     return 1
 
 
+# ----------------------------------------------------------------------------- split
+
+LANE_HINTS = [
+    ("前端", ("web/", "h5/", "front/", "src/pages/", "src/components/", "src/views/",
+              ".vue", ".tsx", ".jsx", ".css", ".scss", ".less", "static/", "public/")),
+    ("后端", ("src/main/java", "src/main/kotlin", "controller/", "service/", "dao/",
+              "mapper/", "handler/", "api/", "server/", ".java", ".kt", ".go", ".py")),
+    ("数据库/迁移", ("migration", "migrations/", ".sql", "alembic/", "flyway")),
+    ("文档", ("docs/", ".md", "readme")),
+    ("配置/构建", ("pom.xml", "build.gradle", "package.json", "requirements.txt",
+                   ".yml", ".yaml", ".toml", ".ini", "dockerfile", "makefile")),
+]
+
+
+# 先按文件类型判，再看路径：`docs/api/refund.md` 里既有 docs/ 也有 api/，
+# 光看关键词会被判成后端，车道名字就错了
+EXT_HINTS = {
+    "文档": (".md", ".rst", ".txt", ".adoc"),
+    "数据库/迁移": (".sql",),
+    "前端": (".vue", ".tsx", ".jsx", ".css", ".scss", ".less", ".svelte"),
+    "后端": (".java", ".kt", ".go", ".py", ".cs", ".php", ".rb", ".rs", ".scala"),
+    "配置/构建": (".yml", ".yaml", ".toml", ".ini", ".xml", ".gradle"),
+}
+
+
+def lane_hint(path: str) -> str:
+    """按文件类型 + 路径猜这块活归哪个端——只用来给车道起名和配平，不做硬分组。"""
+    low = path.lower().replace("\\", "/")
+    ext = Path(low).suffix
+    for name, exts in EXT_HINTS.items():
+        if ext in exts:
+            return name
+    if any(k in low for k in ("migration", "alembic", "flyway", "db/migrate")):
+        return "数据库/迁移"
+    for name, keys in LANE_HINTS:
+        if any(k in low for k in keys):
+            return name
+    return "其它"
+
+
+def _clean_path(raw: str) -> str:
+    s = raw.strip().strip("`").strip()
+    s = re.sub(r":\d+(-\d+)?$", "", s)          # 去掉 :行号
+    s = s.replace("（新）", "").replace("(新)", "").replace("（改）", "").replace("(改)", "")
+    return s.strip()
+
+
+def _split_paths(raw: str) -> list[str]:
+    """一格写多个文件时拆开：`src/a.py, src/b.py` / `src/a.py、src/b.py`。
+
+    只在每一段都像路径时才拆（含 `/` 或带扩展名），免得把一句说明文字拆成垃圾。
+    """
+    parts = [x for x in re.split(r"[,，、;；]\s*", raw or "") if x.strip()]
+    if len(parts) <= 1:
+        return [_clean_path(raw)] if raw and raw.strip() else []
+    out: list[str] = []
+    for part in parts:
+        f = _clean_path(part)
+        if f and ("/" in f or "\\" in f or "." in Path(f).name):
+            out.append(f)
+    return out or [_clean_path(raw)]
+
+
+def planned_files(root: Path) -> list[dict]:
+    """这一轮计划要动的文件：state 未闭环项 → S1 改造清单 → 影响面.json，按优先级合并。"""
+    items: dict[str, dict] = {}
+
+    def add(raw: str, action: str, source: str) -> None:
+        for f in _split_paths(raw):
+            if not f or f.startswith((".devloop", "./.devloop")):
+                continue
+            if f in items:
+                continue
+            items[f] = {"file": f, "action": action, "source": source,
+                        "hint": lane_hint(f), "exists": (root / f).exists()}
+
+    state_file = root / STATE_DIR / "状态.json"
+    if state_file.exists():
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
+        for it in state.get("open_items", []):
+            if it.get("done"):
+                continue
+            parts = [x.strip() for x in str(it.get("item", "")).split("|")]
+            if len(parts) >= 2:
+                add(parts[1], parts[2] if len(parts) > 2 else "", "state")
+
+    s1 = root / STATE_DIR / DEFAULT_DOC["S1"]
+    if s1.exists():
+        body = section_body(read_text(s1), ("改造清单",))
+        for line in body.splitlines():
+            if not line.strip().startswith("|") or TABLE_SEP_RE.match(line.strip()):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if len(cells) < 2 or line.strip().replace("|", "").strip().startswith("-"):
+                continue
+            # 表头也是以 | 开头的「数据行」：`| 编号 | 文件:行 | 动作 | 理由 |`
+            # 不排掉的话，「文件:行」会被当成一个计划文件，split 永远少改一个
+            head = cells[0].strip("*_ ")
+            if re.fullmatch(r"(编号|序号|id|no\.?|#)", head, re.I) or \
+                    _clean_path(cells[1]) in ("文件", "文件:行", "文件位置", "路径", "改动"):
+                continue
+            add(cells[1], cells[2] if len(cells) > 2 else "", "S1")
+
+    impact = root / STATE_DIR / "影响面.json"
+    if impact.exists():
+        try:
+            data = json.loads(impact.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        for f in data.get("files", []):
+            if f.get("status") != "D":
+                add(f.get("file", ""), "改", "impact")
+
+    return list(items.values())
+
+
+DOC_SUFFIXES = {".md", ".rst", ".txt"}
+
+
+def _symbol_index(root: Path, names: list[str]) -> dict[str, str]:
+    """符号 → 定义它的那个文件，只留「能当证据」的符号。
+
+    两条降噪：同名文件（模块名，比如三个 refund.* 都会吐出 "refund"）不算；
+    只在一个文件里定义、且长度 ≥4 的才算。不然一个 "refund" 就能把整盘连成一条车道。
+    """
+    defined: dict[str, set[str]] = {}
+    for f in names:
+        for s in collect_defs(root, f):
+            if len(s) >= 4:
+                defined.setdefault(s, set()).add(f)
+    stems: dict[str, set[str]] = {}
+    for f in names:
+        stems.setdefault(Path(f).stem.lower(), set()).add(f)
+    ok: dict[str, str] = {}
+    for s, files in defined.items():
+        if len(files) != 1:
+            continue
+        if len(stems.get(s.lower(), set())) > 1:
+            continue
+        ok[s] = next(iter(files))
+    return ok
+
+
+def _couples(root: Path, a: str, b: str, index: dict[str, str] | None = None) -> list[str]:
+    """a、b 之间有没有符号级引用：有就必须放同一条车道，否则合并时会打架。
+
+    文档/说明类（.md 等）不参与符号耦合：文档引用一个函数名不代表改代码会冲突，
+    它有自己的同步阶段（S4）。它们只会因为「同一个文件」而合并。
+    """
+    if a == b:
+        return []
+    if Path(a).suffix.lower() in DOC_SUFFIXES or Path(b).suffix.lower() in DOC_SUFFIXES:
+        return []
+    syms = index if index is not None else _symbol_index(root, [a, b])
+    hits: list[str] = []
+    for src, dst in ((a, b), (b, a)):
+        text = read_text(root / src, limit=400_000)
+        if not text:
+            continue
+        for s, owner in syms.items():
+            if owner != dst:
+                continue
+            if re.search(rf"\b{re.escape(s)}\b", text):
+                hits.append(f"{src} → {s}（定义在 {dst}）")
+    return hits
+
+
+def build_lanes(root: Path, files: list[dict], max_lanes: int = 3) -> dict:
+    """把计划文件按「引用耦合」合并成互不冲突的车道。
+
+    两条铁律：同一车道内的文件可以互相引用（它们由同一个子代理顺序改）；
+    不同车道之间必须零文件交集、零符号引用——否则就退回串行。
+    """
+    names = [f["file"] for f in files]
+    parent = {n: n for n in names}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: str, y: str) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[ry] = rx
+
+    sym_index = _symbol_index(root, names)
+    couples: list[dict] = []
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            hits = _couples(root, a, b, sym_index)
+            if hits:
+                union(a, b)
+                couples.extend(hits)
+
+    groups: dict[str, list[str]] = {}
+    for n in names:
+        groups.setdefault(find(n), []).append(n)
+
+    by_file = {f["file"]: f for f in files}
+    comps = []
+    for members in groups.values():
+        hints = [by_file[m]["hint"] for m in members]
+        main_hint = max(set(hints), key=hints.count)
+        comps.append({"files": sorted(members), "hint": main_hint})
+    comps.sort(key=lambda c: (-len(c["files"]), c["files"][0]))
+
+    lanes: list[dict] = []
+    for comp in comps:
+        if len(lanes) < max_lanes:
+            target = next((l for l in lanes if l["hint"] == comp["hint"]), None)
+            if target is None or len(target["files"]) >= 4:
+                target = min(lanes, key=lambda l: len(l["files"])) if len(lanes) == max_lanes else None
+            if target is None:
+                lanes.append({"hint": comp["hint"], "files": list(comp["files"])})
+                continue
+            target["files"].extend(comp["files"])
+        else:
+            smallest = min(lanes, key=lambda l: len(l["files"]))
+            smallest["files"].extend(comp["files"])
+
+    for i, lane in enumerate(lanes, 1):
+        lane["id"] = f"L{i}"
+        lane["files"] = sorted(lane["files"])
+        lane["items"] = [by_file[f] for f in lane["files"]]
+        lane["missing"] = [f for f in lane["files"] if not (root / f).exists()]
+        lane["prompt"] = _lane_prompt(lane)
+
+    # 派发清单：主代理照这个数组逐个起子代理，不用再解析 markdown
+    dispatch = [{"name": _lane_name(lane),
+                 "files": lane["files"], "prompt": lane["prompt"]} for lane in lanes]
+    return {"lanes": lanes, "couples": couples,
+            "files": [f["file"] for f in files], "max_lanes": max_lanes,
+            "parallel": len(lanes) > 1, "dispatch": dispatch}
+
+
+def _lane_name(lane: dict) -> str:
+    return f"lane-{lane['id'].lower()}-{lane['hint']}"
+
+
+def _lane_prompt(lane: dict) -> str:
+    """一条车道的子代理 prompt：文件清单写死，越界即作废，自检要落盘。"""
+    return "\n".join([
+        "你只负责下面这些文件，不要碰其它文件：",
+        *[f"- {f}" for f in lane["files"]],
+        "",
+        f"自检结果写到 .devloop/回执/{_lane_name(lane)}.md，必须包含四行：",
+        "- 改了哪些文件与关键行",
+        "- 命令：<你跑的命令>",
+        "- 红：<实现前失败的输出摘要>",
+        "- 绿：<实现后通过的输出摘要>",
+        "没有这份回执，主代理证明不了你验过，S2 门会直接拒收。",
+        "如果发现必须改到车道外的文件，停下来报告，不要自己动手。",
+    ])
+
+
+def _lanes_md(root: Path, plan: dict) -> str:
+    lanes = plan["lanes"]
+    md = ["# S2 并行方案", "",
+          f"- 生成时间：{now()}",
+          f"- 计划文件：{len(plan['files'])} 个",
+          f"- 车道：{len(lanes)} 条" + ("（可并行）" if len(lanes) > 1 else "（只能串行）"),
+          "- 判据：同一车道内允许互相引用；**不同车道之间零文件交集、零符号引用**", ""]
+    if len(lanes) == 1:
+        md += ["> 只有一个车道：这些文件互相引用，拆开必然打架。按顺序做，别硬并行。", ""]
+    for lane in lanes:
+        md += [f"## 车道 {lane['id']} · {lane['hint']}（{len(lane['files'])} 个文件）", "",
+               "| 文件 | 动作 | 来源 |", "|---|---|---|"]
+        for it in lane["items"]:
+            note = "（待新建）" if not it["exists"] else ""
+            md.append(f"| `{it['file']}`{note} | {it['action'] or '—'} | {it['source']} |")
+        md += ["", "**子代理 prompt（原样粘给一个子代理）**", "", "```text",
+               lane["prompt"], "```", ""]
+    if plan["couples"]:
+        md += ["## 为什么这样分组（耦合证据）", ""]
+        md += [f"- {c}" for c in plan["couples"][:40]]
+        md += [""]
+    if len(lanes) > 1:
+        md += ["## 主代理怎么派（这一步不做，等于没拆）", "",
+               f"**在同一条消息里发起 {len(lanes)} 个子代理**，不要一个一个来；"
+               "它们各自只改自己那份文件清单。", "",
+               "```text",
+               "① 同时发起（同一条消息里并列写多个 Agent 调用）：",
+               *[f'  Agent(description="改{lane["id"]} {lane["hint"]}", '
+                 f'subagent_type="general-purpose", prompt=<车道 {lane["id"]} 的 prompt>)'
+                 for lane in lanes],
+               "② 等全部返回，逐个核对它报的文件是否都在自己车道内",
+               "③ 有任何越界：回滚该车道的改动，重新 split，不要手工合并",
+               "④ 全部合并后主代理统一跑全量测试，再填 S2 红绿证据与回访",
+               "```", ""]
+    md += ["## 派发纪律", "",
+           "1. 每条车道一个子代理，prompt 里写死文件清单，越界即作废。",
+           "2. 子代理只改自己车道；发现需要跨车道改动，先回报，由主代理调整方案。",
+           "3. 全部回来后主代理统一跑全量测试、S2 红绿证据与回访，再进 S3 审计。",
+           "4. 车道少于 2 条就不要并行——并行收益是 0，冲突风险是真的。", ""]
+    return "\n".join(md)
+
+
+# 并行对账时要忽略的构建/缓存产物：它们不是活，报出来只会淹没真正的问题
+VERIFY_NOISE = ("node_modules/", "__pycache__/", ".pytest_cache/", ".mypy_cache/",
+                ".ruff_cache/", ".venv/", "venv/", "dist/", "build/", "target/",
+                "coverage/", ".idea/", ".vscode/", ".next/", ".tox/")
+
+
+# 测试文件本来就不在 S1 改造清单里（清单是「改哪些业务文件」），
+# S2 才写测试，所以它们算正常产出，不算越界；单独列出来让人看一眼就够。
+TEST_LIKE = re.compile(
+    r"(^|/)(tests?|__tests__|spec)/|(^|/)(test_[^/]*|[^/]*_test)\.py$|"
+    r"\.(spec|test)\.(ts|tsx|js|jsx)$|(Test|Tests)\.java$", re.I)
+
+
+def _is_test_file(path: str) -> bool:
+    return bool(TEST_LIKE.search(path.replace("\\", "/")))
+
+
+def _is_noise(path: str) -> bool:
+    low = path.replace("\\", "/")
+    if any(seg in low for seg in VERIFY_NOISE):
+        return True
+    return Path(low).suffix in (".pyc", ".pyo", ".log") or low.endswith(".DS_Store")
+
+
+def verify_parallel(root: Path, plan: dict, allow: set[str] | None = None
+                    ) -> tuple[list[str], list[dict]]:
+    """并行改完之后对账：实际改动有没有跑出车道。
+
+    脚本看不到「是哪个子代理改的」，但看得到「改了哪些文件」——
+    计划外文件、计划文件没动、某条车道整体没动，这三类都能抓出来。
+    """
+    allow = allow or set()
+    entries = git_status_entries(root)
+    actual = {e["file"] for e in entries if not _is_noise(e["file"])} - allow
+    planned = set(plan.get("files") or [])
+    problems: list[str] = []
+
+    extra = sorted(actual - planned)
+    tests_touched = [f for f in extra if _is_test_file(f)]
+    extra = [f for f in extra if not _is_test_file(f)]
+    if extra:
+        problems.append("改了计划外的文件（越界，或你顺手改了别的）："
+                        + "、".join(extra[:8]))
+    missing = sorted(planned - actual)
+    if missing:
+        problems.append("计划内的文件没有任何改动（漏改 / 子代理没跑完）："
+                        + "、".join(missing[:8]))
+
+    rows: list[dict] = []
+    for lane in plan.get("lanes") or []:
+        touched = [f for f in lane["files"] if f in actual]
+        untouched = sorted(set(lane["files"]) - set(touched))
+        if lane["files"] and not touched:
+            problems.append(f"{lane['id']}（{lane['hint']}）整条车道没动——"
+                            "这个子代理可能没跑或失败了")
+        rows.append({"id": lane["id"], "hint": lane["hint"],
+                     "total": len(lane["files"]), "touched": len(touched),
+                     "untouched": untouched, "tests": []})
+    if tests_touched:
+        rows.append({"id": "测试", "hint": "S2 产出", "total": len(tests_touched),
+                     "touched": len(tests_touched), "untouched": [],
+                     "tests": tests_touched})
+    return problems, rows
+
+
+def cmd_split(args) -> int:
+    """把 S2 的实现活拆成互不冲突的车道，给并行子代理用。"""
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+    plan_path0 = out_dir / "S2-并行方案.json"
+
+    if getattr(args, "verify", False):
+        # 对账用已有方案，不重新算：重算会把你手工调过的车道覆盖掉
+        if not plan_path0.exists():
+            print("还没有并行方案（S2-并行方案.json），先跑一次 split 生成车道。")
+            return 2
+        try:
+            plan = json.loads(plan_path0.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"并行方案读不出来：{exc}")
+            return 2
+        allow = {x.strip() for x in (getattr(args, "allow", "") or "").split(",") if x.strip()}
+        # 方案可能是几天前算的：清单加了新文件而没重跑 split，这里得提一句，
+        # 否则「对账通过」只证明了旧边界，新加的那块根本没人管
+        current = {f["file"] for f in planned_files(root)}
+        planned = set(plan.get("files") or [])
+        if current != planned:
+            added = sorted(current - planned)
+            gone = sorted(planned - current)
+            print("注意：计划已变，方案可能过期（建议重跑 split 重算车道）")
+            if added:
+                print(f"  清单新增：{'、'.join(added[:5])}")
+            if gone:
+                print(f"  清单去掉：{'、'.join(gone[:5])}")
+            print()
+        problems, rows = verify_parallel(root, plan, allow)
+        print("并行改完对账（按 git 实际改动）：")
+        for r in rows:
+            miss = f"  未动：{'、'.join(r['untouched'][:4])}" if r["untouched"] else ""
+            print(f"  {r['id']} {r['hint']}：{r['touched']}/{r['total']} 个文件有改动{miss}")
+            if r.get("tests"):
+                print(f"     新增/改动的测试文件（不算越界）：{'、'.join(r['tests'][:5])}")
+        test_cmd = getattr(args, "cmd", "") or ""
+        if test_cmd:
+            # 并行最容易出的问题不是冲突，是「每条车道自己绿、合起来红」——
+            # 所以对账之后直接跑一次全量，别让主代理凭感觉说「应该没问题」
+            started = time.time()
+            try:
+                run = subprocess.run(test_cmd, cwd=str(root), shell=True,
+                                     capture_output=True, encoding="utf-8",
+                                     errors="replace",
+                                     timeout=int(getattr(args, "timeout", 900) or 900))
+                code, output = run.returncode, (run.stdout or "") + "\n" + (run.stderr or "")
+            except subprocess.TimeoutExpired:
+                code, output = 124, ""
+            except Exception as exc:  # noqa: BLE001
+                code, output = 1, str(exc)
+            elapsed = round(time.time() - started, 1)
+            print(f"\n全量测试：`{test_cmd}` → 退出码 {code}（{elapsed}s）")
+            tail = [ln for ln in output.strip().splitlines() if ln.strip()][-3:]
+            for ln in tail:
+                print(f"  {ln[:160]}")
+            if code != 0:
+                problems.append(f"合起来跑全量测试没过（退出码 {code}）——"
+                                "每条车道自己绿不代表整体绿")
+
+        if problems:
+            print(f"\n不通过（{len(problems)} 项）：")
+            for p in problems:
+                print(f"  - {p}")
+            print("  越界就回滚那条车道的改动、重新 split；漏改就让对应子代理补完。")
+            return 3
+        print("\n通过：改动没跑出车道，计划文件全部有改动"
+              + ("，全量测试通过。" if test_cmd else "。"))
+        if not test_cmd:
+            print("  建议加 --cmd \"<全量测试命令>\"：每条车道自己绿不等于整体绿。")
+        print("  下一步：把红绿证据填进 S2-实现.md，再走 S2 门。")
+        return 0
+
+    files = planned_files(root)
+    if not files:
+        print("没有可拆的计划文件：state 里没有未闭环项，也没找到 S1 改造清单或影响面.json。")
+        print("  先跑：state --add \"C1 | 文件 | 动作 | 理由\" 或 stage --stage S1")
+        return 2
+
+    plan = build_lanes(root, files, max(1, min(args.max, 6)))
+    plan_path = out_dir / "S2-并行方案.json"
+    md_path = out_dir / "S2-并行方案.md"
+    if plan_path.exists():
+        try:
+            old_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except Exception:
+            old_plan = {}
+        old_lanes = [[f for f in lane.get("files", [])] for lane in old_plan.get("lanes", [])]
+        new_lanes = [lane["files"] for lane in plan["lanes"]]
+        if old_lanes and old_lanes != new_lanes:
+            backup = out_dir / "S2-并行方案-上一版.json"
+            backup.write_text(json.dumps(old_plan, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+            print(f"车道划分变了，上一版方案已备份：{backup}")
+    write_json(plan_path, plan)
+    md_path.write_text(_lanes_md(root, plan), encoding="utf-8")
+    refresh_reports(root, "S2")
+
+    if args.check:
+        problems = check_lanes(root, plan)
+        if problems:
+            print(f"并行方案不成立（{len(problems)} 项）：")
+            for p in problems:
+                print(f"  - {p}")
+            return 3
+        print("并行方案校验通过：车道之间零文件交集、零符号引用，计划文件全覆盖。")
+
+    lanes = plan["lanes"]
+    print(f"并行方案 -> {md_path}")
+    print(f"  {len(files)} 个计划文件 → {len(lanes)} 条车道"
+          + ("（可并行）" if len(lanes) > 1 else "（只能串行）"))
+    for lane in lanes:
+        print(f"  {lane['id']} {lane['hint']}：{len(lane['files'])} 个文件")
+    if len(lanes) > 1:
+        print(f"\n下一步：**同一条消息里同时发起 {len(lanes)} 个子代理**（不是一个接一个）：")
+        for d in plan["dispatch"]:
+            print(f"  - {d['name']}：{'、'.join(d['files'])}")
+        print("  prompt 原文在方案文件的「子代理 prompt」小节，或读 "
+              f"{plan_path.name} 的 dispatch[].prompt")
+        print("  全部返回后核对越界、跑全量测试，再填 S2 红绿证据与回访。")
+    else:
+        print("\n这些文件互相引用，拆开必然打架——按顺序做，不派子代理。")
+    if args.check and check_lanes(root, plan):
+        return 3
+    return 0
+
+
+def check_lanes(root: Path, plan: dict) -> list[str]:
+    """校验车道划分：覆盖全、互不重叠、跨车道没有符号引用。"""
+    problems: list[str] = []
+    seen: dict[str, str] = {}
+    for lane in plan.get("lanes", []):
+        for f in lane["files"]:
+            if f in seen:
+                problems.append(f"{f} 同时出现在 {seen[f]} 和 {lane['id']}")
+            seen[f] = lane["id"]
+    missing = [f for f in plan.get("files", []) if f not in seen]
+    if missing:
+        problems.append(f"计划文件没被分到任何车道：{'、'.join(missing)}")
+    lanes = plan.get("lanes", [])
+    sym_index = _symbol_index(root, plan.get("files", []))
+    for i in range(len(lanes)):
+        for j in range(i + 1, len(lanes)):
+            for a in lanes[i]["files"]:
+                for b in lanes[j]["files"]:
+                    hits = _couples(root, a, b, sym_index)
+                    if hits:
+                        problems.append(f"{lanes[i]['id']} 与 {lanes[j]['id']} 有耦合：{hits[0]}")
+    return problems
+
+
 def cmd_state(args) -> int:
     root = Path(args.root).resolve()
     path = ensure_state_dir(root) / "状态.json"
@@ -2753,6 +3573,7 @@ def cmd_state(args) -> int:
     # 断线重连后用户第一眼看的就是这页，不能停在上一个状态
     if args.set or args.round:
         refresh_reports(root, None)
+    index_upsert(root)
 
     if args.show or not (args.set or args.add or args.close is not None
                          or args.note or args.round):
@@ -3120,6 +3941,20 @@ def cmd_stage(args) -> int:
         report_mod.write_report(root, VERSION)
         print(f"\n初稿 -> {doc}")
         print(f"从 S0 抄来 {len(acs)} 条验收标准；每条先写失败测试、留红色输出，再实现")
+        plan_file = out_dir / "S2-并行方案.json"
+        if plan_file.exists():
+            try:
+                plan = json.loads(plan_file.read_text(encoding="utf-8"))
+            except Exception:
+                plan = {}
+            n = len(plan.get("lanes") or [])
+            if plan.get("parallel") and n > 1:
+                print(f"  已有并行方案：{n} 条车道互不冲突——必须同时发起 {n} 个子代理，"
+                      "照着 S2-并行方案.json 的 dispatch 派")
+            elif n:
+                print("  已有并行方案：文件互相引用，只能串行，别拆子代理")
+        else:
+            print("  计划文件互不引用时先跑 split --check，能拆就并行")
         print("  豁免：纯文档/配置改动可 gate --stage S2 --skip --note \"无行为变更\"")
         return 0
 
@@ -3398,6 +4233,23 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--note", default="", help="用户原话，确认或跳过时必填")
     g.add_argument("--show", action="store_true", help="查看各阶段确认状态")
     g.set_defaults(func=cmd_gate)
+
+    rs = sub.add_parser("resume", help="跨会话续跑：认出哪个项目、走到哪、在等什么")
+    rs.add_argument("--root", default="",
+                    help="项目根或项目名；省略则认当前目录，认不出再列全部")
+    rs.add_argument("--all", action="store_true", help="列出所有项目，不管当前目录")
+    rs.set_defaults(func=cmd_resume)
+
+    sp = sub.add_parser("split", help="把 S2 的实现活拆成互不冲突的车道（给并行子代理）")
+    sp.add_argument("--root", default=".")
+    sp.add_argument("--max", type=int, default=3, help="最多几条车道，默认 3")
+    sp.add_argument("--check", action="store_true", help="校验车道之间确实零重叠")
+    sp.add_argument("--verify", action="store_true",
+                    help="并行改完后对账：实际改动是否都在各自车道内")
+    sp.add_argument("--allow", default="", help="--verify 时允许的计划外文件，逗号分隔")
+    sp.add_argument("--cmd", default="", help="--verify 时顺带跑的全量测试命令")
+    sp.add_argument("--timeout", type=int, default=900, help="--cmd 的超时秒数，默认 900")
+    sp.set_defaults(func=cmd_split)
 
     ckd = sub.add_parser("check", help="只校验阶段报告是否达标，不登记（改稿时反复用）")
     ckd.add_argument("--root", default=".")
