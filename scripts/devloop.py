@@ -43,10 +43,11 @@ if str(_HERE) not in sys.path:
 
 import astindex  # noqa: E402  符号索引与盲区检测
 import quality as quality_mod  # noqa: E402  实现质量扫描
+import ui_check  # noqa: E402  业务前端 UI 检查
 import report as report_mod
 import diagram as diagram_mod  # noqa: E402  Markdown → HTML 报告
 
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 STATE_DIR = ".devloop"
 MAX_FILE_BYTES = 1_200_000
 MAX_FILES = 60000
@@ -1914,6 +1915,37 @@ def needs_contract(files: list[str]) -> bool:
     return front and back
 
 
+def has_frontend(files: list[str]) -> bool:
+    return any(Path(f).suffix.lower() in ui_check.UI_EXTS for f in files)
+
+
+def check_ui_plan(text: str) -> list[str]:
+    """改前端就要有界面方案，否则「好看」全靠实现时临场发挥。"""
+    body = section_body(text, ("界面方案", "页面方案", "UI 方案", "界面设计"))
+    if not body.strip() or count_items(body) < 1:
+        return ["界面方案（含前端改动时必填：页面与路由 / 组件拆分 / 加载·空·错误三态 / "
+                "断点 / token 来源）"]
+    return []
+
+
+def check_ui_selfcheck(text: str, root: Path) -> list[str]:
+    """实现完要交界面自查：UI 检查结果或截图，不能只说「已实现」。
+
+    写了截图路径就得真有那张图——「截图：见附件」这种最容易被糊过去。
+    """
+    body = section_body(text, ("界面自查", "UI 自查", "界面检查"))
+    if not body.strip() or count_items(body) < 1:
+        return ["界面自查（前端改动要有：`devloop ui` 的结论，或截图路径 + 实际看到的问题）"]
+    paths = re.findall(r"[^\s`'\"()：]+\.(?:png|jpe?g|webp)", body, re.I)
+    if "截图" in body and paths:
+        missing = [p for p in paths
+                   if not (root / p).exists() and not Path(p).exists()]
+        if len(missing) == len(paths):
+            return [f"界面自查里的截图都不存在：{'、'.join(missing[:3])}——"
+                    "贴了路径就要真有那张图"]
+    return []
+
+
 def check_contract(text: str) -> list[str]:
     """跨端改动必须在 S1 写清接口长什么样。
 
@@ -2588,11 +2620,17 @@ def cmd_gate(args) -> int:
     # S0 与 S2 光有小节不够：一个要真问过并拿到答案，一个要真走过红绿
     if stage == "S0":
         missing += check_clarify(text)
-    elif stage == "S1" and needs_contract(files):
+    elif stage == "S1":
         # 跨端改动：方案里没定接口，就等于让两边各猜一遍
-        missing += check_contract(text)
+        if needs_contract(files):
+            missing += check_contract(text)
+        # 改前端：没有界面方案，"好看"就全靠实现时临场发挥
+        if has_frontend(files):
+            missing += check_ui_plan(text)
     elif stage == "S2":
         missing += check_tdd(text)
+        if has_frontend(files):
+            missing += check_ui_selfcheck(text, root)
         plan_file = root / STATE_DIR / "S2-并行方案.json"
         if plan_file.exists():
             try:
@@ -3655,6 +3693,41 @@ def cmd_blind(args) -> int:
 
 # ----------------------------------------------------------------------------- quality
 
+def cmd_ui(args) -> int:
+    """业务前端 UI 静态检查：抓一眼能判定的丑与不可用。"""
+    root = Path(args.root).resolve()
+    out_dir = ensure_state_dir(root)
+
+    files = [x.strip() for x in (getattr(args, "files", "") or "").split(",")
+             if x.strip()]
+    if not files:
+        files = [e["file"] for e in git_status_entries(root)]
+        if getattr(args, "base", ""):
+            files += changed_files_now(root, args.base)
+    files = sorted({f for f in files if Path(f).suffix.lower() in ui_check.UI_EXTS})
+
+    if not files:
+        print("没有前端文件（.vue / .tsx / .jsx / .svelte / .css / .html），跳过 UI 检查。")
+        return 0
+
+    issues = ui_check.scan(root, files)
+    md_path = out_dir / "UI质量.md"
+    md_path.write_text(ui_check.render_md(issues, files), encoding="utf-8")
+
+    p0 = [i for i in issues if i["level"] == "P0"]
+    p1 = [i for i in issues if i["level"] == "P1"]
+    print(f"UI 质量 -> {md_path}（P0 {len(p0)} / P1 {len(p1)} / "
+          f"P2 {len(issues) - len(p0) - len(p1)}，{len(files)} 个前端文件）")
+    for i in (p0 + p1)[:8]:
+        where = f"{i['file']}:{i['line']}" if i["line"] else i["file"]
+        print(f"  {i['level']} {i['id']} {i['title']}  {where}")
+        print(f"      {i['snippet'] or i['why']}")
+    if p0:
+        print("  P0 是硬伤（焦点/对比/越界/图片无 alt），改完再提交。")
+        return 1
+    return 0
+
+
 def cmd_quality(args) -> int:
     root = Path(args.root).resolve()
     out_dir = ensure_state_dir(root)
@@ -3771,6 +3844,14 @@ def _compose_s2(root: Path, out_dir: Path, base: str) -> tuple[str, list[str]]:
     if not b_body:
         b_body = "\n".join(l for l in blind_md.splitlines() if not l.startswith("# ")).strip()
     parts += ["## 静态盲区", "", _demote_md(b_body) or "无", ""]
+
+    # 前端改动才有：业务 UI 的硬伤和实现质量并列，P0 同样要清
+    ui_md = read_text(out_dir / "UI质量.md")
+    if ui_md.strip():
+        u_body = _section_of(ui_md, "UI 质量")
+        if not u_body:
+            u_body = "\n".join(l for l in ui_md.splitlines() if not l.startswith("# ")).strip()
+        parts += ["## 业务 UI", "", _demote_md(u_body) or "无", ""]
 
     return "\n".join(parts), []
 
@@ -3965,6 +4046,8 @@ def cmd_stage(args) -> int:
         cmd_quality(argparse.Namespace(root=str(root), base=base, files=",".join(files)))
         # 盲区
         cmd_blind(argparse.Namespace(root=str(root), base=base, files=",".join(files)))
+        # 业务前端 UI：与质量、盲区并列，P0 会写进审计报告
+        cmd_ui(argparse.Namespace(root=str(root), base=base, files=",".join(files)))
 
         composed, _ = _compose_s2(root, out_dir, base)
         doc = out_dir / "S3-变更审计.md"
@@ -4239,6 +4322,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="项目根或项目名；省略则认当前目录，认不出再列全部")
     rs.add_argument("--all", action="store_true", help="列出所有项目，不管当前目录")
     rs.set_defaults(func=cmd_resume)
+
+    ui = sub.add_parser("ui", help="业务前端 UI 检查：token / 焦点 / 状态 / 响应式 / 禁用项")
+    ui.add_argument("--root", default=".")
+    ui.add_argument("--files", default="", help="逗号分隔；省略则取本次改动的文件")
+    ui.add_argument("--base", default="HEAD")
+    ui.set_defaults(func=cmd_ui)
 
     sp = sub.add_parser("split", help="把 S2 的实现活拆成互不冲突的车道（给并行子代理）")
     sp.add_argument("--root", default=".")
